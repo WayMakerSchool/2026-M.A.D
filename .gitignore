@@ -1,0 +1,28 @@
+# macOS
+.DS_Store
+
+# 에디터 설정
+.vscode/
+.idea/
+
+# 의존성 폴더
+node_modules/
+
+# Python 가상환경 / 캐시
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# 비밀 정보 (API 키 등은 절대 올리지 마세요!)
+.env
+.env.local
+*.key
+
+# 작업 도구 설정
+.claude/
+
+# 작업 중 만든 백업 폴더 (저장소에 올리지 않아요)
+backup-*/
+*.backup
+*.backup2

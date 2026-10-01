@@ -1,0 +1,150 @@
+/* ═══════════════════════════════════════════════════════════════════
+   ShoMate — Toss-tone theme (override layer)
+   번들(index-*.js)과 번들 CSS는 건드리지 않는다. Tailwind v4 테마 변수와
+   유틸리티만 위에서 덮어써서 톤을 바꾼다. 되돌리려면 index.html에서 이 파일의
+   <link> 한 줄만 지우면 된다.
+   원칙: 여백으로 구분 · 테두리/그림자 최소 · 둥근 모서리 · 굵고 또렷한 타이포
+   ═══════════════════════════════════════════════════════════════════ */
+/* 폰트(Pretendard)는 index.html 의 <link> 로 로드 — CDN 불가 시 Apple SD Gothic Neo 등 시스템 폰트로 폴백 */
+
+:root {
+  /* ── 회색 스케일 (토스 그레이) ── */
+  --color-gray-50: #F9FAFB;  --color-gray-100: #F2F4F6; --color-gray-200: #E5E8EB;
+  --color-gray-300: #D1D6DB; --color-gray-400: #B0B8C1; --color-gray-500: #8B95A1;
+  --color-gray-600: #6B7684; --color-gray-700: #4E5968; --color-gray-800: #333D4B;
+  --color-gray-900: #191F28; --color-gray-950: #191F28;
+  --color-slate-50: #F9FAFB; --color-slate-100: #F2F4F6;
+  --color-black: #191F28;
+
+  /* ── 브랜드 보라 (유지, 채도만 차분하게) ── */
+  --color-indigo-50: #F4F3FF;  --color-indigo-100: #E9E7FF; --color-indigo-200: #D6D2FF;
+  --color-indigo-300: #B7B0FF; --color-indigo-400: #8F84FF; --color-indigo-500: #6B5CFF;
+  --color-indigo-600: #5B4BF5; --color-indigo-700: #4A3BD9; --color-indigo-800: #3B2FB0;
+  --color-indigo-900: #2E2589; --color-indigo-950: #1C1655;
+  --color-violet-50: #F4F3FF;  --color-violet-100: #E9E7FF; --color-violet-500: #6B5CFF;
+  --color-violet-600: #5B4BF5; --color-violet-900: #2E2589;
+  --color-purple-50: #F4F3FF;
+
+  /* ── 의미 색 (토스 톤) ── */
+  --color-emerald-50: #EDF9F3; --color-emerald-100: #DDF3E8; --color-emerald-500: #22A06B;
+  --color-emerald-600: #1B9C6B; --color-emerald-700: #158A5E;
+  --color-rose-50: #FEF0F1;    --color-rose-100: #FDE0E3;   --color-rose-500: #F04452;
+  --color-rose-600: #F04452;   --color-rose-700: #D93A47;
+  --color-red-50: #FEF0F1;     --color-red-100: #FDE0E3;    --color-red-500: #F04452;
+  --color-red-600: #E03B4A;    --color-red-700: #C7333F;
+  --color-amber-50: #FFF8E6;   --color-amber-100: #FFF1CC;  --color-amber-500: #F5A623;
+  --color-amber-600: #E0951C;  --color-amber-700: #B87A12;
+  --color-orange-50: #FFF4E6;  --color-orange-100: #FFE8CC; --color-orange-500: #FF8A00;
+  --color-orange-600: #E67C00; --color-orange-700: #BF6700;
+
+  /* ── 모서리: 한 단계씩 더 둥글게 ── */
+  --radius-md: 10px; --radius-lg: 12px; --radius-xl: 16px; --radius-2xl: 20px; --radius-3xl: 24px;
+
+  /* ── 타이포 ── */
+  --font-sans: "Pretendard Variable", Pretendard, -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Segoe UI", Roboto, "Noto Sans KR", sans-serif;
+  --default-font-family: var(--font-sans);
+  --text-xs: 0.8125rem;  --text-xs--line-height: 1.45;   /* 13px */
+  --text-sm: 0.9rem;     --text-sm--line-height: 1.45;   /* 14.4px */
+  --text-base: 1rem;     --text-base--line-height: 1.5;
+  --text-lg: 1.1875rem;  --text-lg--line-height: 1.35;   /* 19px */
+  --text-xl: 1.375rem;   --text-2xl: 1.625rem;
+}
+
+html, body, #root { font-family: var(--font-sans); color: #191F28; letter-spacing: -0.01em; -webkit-font-smoothing: antialiased; }
+input, textarea, select, button { font-family: inherit; letter-spacing: inherit; }
+
+/* 마이크로 텍스트 한 단계 키움 (가독성) */
+.text-\[8px\]    { font-size: 9px; }
+.text-\[9px\]    { font-size: 10px; }
+.text-\[9\.5px\] { font-size: 10.5px; }
+.text-\[10px\]   { font-size: 11px; }
+.text-\[10\.5px\]{ font-size: 11.5px; }
+.text-\[11px\]   { font-size: 12px; }
+.text-\[11\.5px\]{ font-size: 12.5px; }
+.text-\[12px\], .text-\[12\.5px\] { font-size: 13px; }
+.text-\[13px\]   { font-size: 14px; }
+
+/* 굵기: 토스는 800보다 700을 씀 — 과한 extrabold를 한 단계 낮춤 */
+.font-extrabold { font-weight: 700; }
+
+/* ── 그림자: 카드 그림자 제거, 떠 있는 요소만 아주 부드럽게 ── */
+.shadow-xs, .shadow-2xs, .shadow-5xs, .shadow-sm, .shadow-md, .shadow-inner { box-shadow: none; }
+.shadow-lg, .shadow-xl { box-shadow: 0 8px 24px rgba(25, 31, 40, 0.08); }
+.shadow-2xl, [class*="shadow-\[0_"] { box-shadow: 0 12px 32px rgba(25, 31, 40, 0.12); }
+
+/* ── 그라데이션 → 플랫 ── */
+.bg-gradient-to-br, .bg-gradient-to-r, .bg-gradient-to-b, .bg-gradient-to-t, .bg-gradient-to-l { background-image: none; }
+.from-indigo-600 { background-color: var(--color-indigo-600); }
+.from-white { background-color: #fff; }
+[class*="from-indigo-50"] { background-color: var(--color-indigo-50); }
+
+/* ── 테두리: 회색 테두리는 헤어라인으로, 색 뱃지 테두리는 제거 ── */
+.border-gray-200, [class*="border-gray-200\/"] { border-color: var(--color-gray-100); }
+.border-gray-100, [class*="border-gray-100\/"] { border-color: #F2F4F6; }
+[class*="border-indigo-"], [class*="border-emerald-"], [class*="border-rose-"], [class*="border-amber-"],
+[class*="border-red-"], [class*="border-orange-"], [class*="border-violet-"] { border-color: transparent; }
+
+/* ── 애니메이션: 깜빡임(pulse) 제거 — 차분하게 ── */
+.animate-pulse { animation: none; }
+
+/* ── 스크롤바 숨김 ── */
+::-webkit-scrollbar { width: 0; height: 0; }
+
+/* ═══════════════════════════ 레이아웃 톤 ═══════════════════════════ */
+
+/* 페이지: 연회색 바탕 + 흰 카드 (테두리 없이 면으로 구분) */
+.flex-1.overflow-y-auto.p-4.pb-20 { background: #F2F4F6; }
+.flex-1.overflow-y-auto.p-4.pb-20 > * > .bg-white.border,
+.flex-1.overflow-y-auto.p-4.pb-20 > .bg-white.border,
+.flex-1.overflow-y-auto.p-4.pb-20 .bg-white.rounded-2xl.border,
+.flex-1.overflow-y-auto.p-4.pb-20 .bg-white.rounded-xl.border { border-color: transparent; }
+/* 흰 카드 안의 흰 박스는 옅은 회색 면으로 (경계가 사라지지 않게) */
+.bg-white .bg-white.border.border-gray-200, .bg-white .bg-white.border.border-gray-100 { background: #F7F8FA; border-color: transparent; }
+
+/* 헤더: 테두리 없이, 제목 굵고 크게 */
+.px-5.py-3.border-b.border-gray-100.bg-white { border-bottom-color: transparent; padding-top: 14px; padding-bottom: 10px; }
+.px-5.py-3.border-b.border-gray-100.bg-white h1 { font-size: 1.125rem; letter-spacing: -0.02em; }
+
+/* 상태 표시줄 ("URL 분석이 완료되었습니다") */
+.px-4.py-2.bg-gray-50.border-b.border-gray-100 { background: #fff; border-bottom-color: transparent; padding-bottom: 6px; }
+.px-4.py-2.bg-gray-50.border-b.border-gray-100 > div { background: #F2F4F6; border-color: transparent; color: #6B7684; border-radius: 10px; padding: 8px 12px; }
+
+/* 섹션 제목: 토스처럼 17px/700 */
+h3.text-sm.font-bold.text-gray-900 { font-size: 1.0625rem; letter-spacing: -0.02em; }
+h2.text-base.font-extrabold.text-gray-900 { font-size: 1.1875rem; letter-spacing: -0.02em; }
+
+/* ── 하단 탭바: 떠 있는 알약 → 토스식 전폭 탭바 (아이콘 위, 라벨 아래) ── */
+.absolute.bottom-4.left-1\/2.-translate-x-1\/2.rounded-full.backdrop-blur-md {
+  left: 0; right: 0; bottom: 0; width: 100%; transform: none; translate: none; border-radius: 0;
+  background: #fff; box-shadow: none; border: 0; border-top: 1px solid #F2F4F6;
+  backdrop-filter: none; padding: 6px 10px 10px; gap: 0; justify-content: space-around;
+}
+.absolute.bottom-4.left-1\/2.-translate-x-1\/2.rounded-full.backdrop-blur-md > button {
+  flex: 1; flex-direction: column; gap: 3px; padding: 6px 0 2px; border-radius: 12px;
+  font-size: 11px; font-weight: 600; box-shadow: none; background: transparent; color: #8B95A1;
+}
+.absolute.bottom-4.left-1\/2.-translate-x-1\/2.rounded-full.backdrop-blur-md > button.bg-indigo-600 { color: var(--color-indigo-600); }
+.absolute.bottom-4.left-1\/2.-translate-x-1\/2.rounded-full.backdrop-blur-md > button svg { width: 22px; height: 22px; }
+.absolute.bottom-4.left-1\/2.-translate-x-1\/2.rounded-full.backdrop-blur-md > button:hover { background: transparent; color: #4E5968; }
+
+/* 주요 버튼: 토스식 둥근 정도 */
+button.bg-indigo-600.rounded-xl, button.bg-indigo-600.rounded-lg, button.bg-gray-900.rounded-xl, button.bg-rose-600.rounded-xl { border-radius: 14px; }
+
+/* ═══════════════ 2차: 회색 바탕에서 카드가 묻히는 문제 ═══════════════ */
+
+/* 경고·안내 카드: 반투명 색 → 또렷한 면 + 같은 계열 헤어라인 */
+.p-3.rounded-lg.border[class*="bg-amber-50"]  { background: #FFF3D6; border-color: #F1E0AC; }
+.p-3.rounded-lg.border[class*="bg-red-50"]    { background: #FEE9EB; border-color: #F6C6CC; }
+.p-3.rounded-lg.border[class*="bg-orange-50"] { background: #FFEEDC; border-color: #F3D4AE; }
+.p-3.rounded-lg.border[class*="bg-gray-50"]   { background: #fff; }
+
+/* AI 분석 카드: 흐릿한 연보라 → 흰 카드 + 연보라 헤어라인 (브랜드 포인트) */
+.rounded-2xl.border.p-4[class*="from-indigo-50"] { background: #FFFFFF; border-color: #E7E4FA; }
+
+/* 가격 평가 칩: 토스 톤 (저렴=초록 / 적당=파랑 / 비쌈=빨강, 이모지 없이 색으로) */
+:root { --color-blue-100: #E8F1FF; --color-blue-200: #C9E2FF; --color-blue-700: #1B64DA; }
+[class*="border-blue-"] { border-color: transparent; }
+
+/* 포커스 링: 브라우저 기본 파란 상자 → 은은한 보라 (키보드 포커스에만) */
+button:focus { outline: none; }
+button:focus-visible { outline: 2px solid rgba(91, 75, 245, 0.35); outline-offset: 2px; border-radius: 12px; }
