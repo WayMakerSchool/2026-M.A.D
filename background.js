@@ -712,9 +712,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 });
 
 // ── Gemini AI 분석 ──────────────────────────────────────────────
-// 가격은 내려보내지 않는다. 사이드바는 sameProductAlts/alternativeProducts 중 가격 필드가 0 보다 큰
-// 항목만 카드로 만드므로, 가격을 빼면 "약 1,650,000원 · AI 추정 · 실제 가격 아님" 카드가 생기지
-// 않는다 — 의도된 동작이다. 베타에서 그 추정가가 네이버에 존재하지 않는 값이라 신뢰를 깼다.
+// 가격은 내려보내지 않는다. 베타에서 "네이버쇼핑 약 1,650,000원" 같은 추정가가 실제로는 존재하지 않는
+// 값이었고, 그 카드가 가디언 1위까지 받아 신뢰를 깼다. 사이드바는 sameProductAlts/alternativeProducts 를
+// 가격 없는 '가격 확인하기' 검색 링크 카드로만 만들고 점수·정렬에서 뺀다 — 캐시에 남은 옛 응답의
+// estimatedPrice 도 읽지 않는다 (tests/sidebar-price.test.js).
 // 실제 가격은 네이버 검색 API(searchShoppingPrices)와 AI 실검색(findRealListings)에서만 온다.
 async function callGemini({ productName, currentPrice, detectedMall, rawText = '', soldOut = false, soldOutText = '' }) {
   const stockLine = soldOut ? `\n판매 상태: 현재 구매 불가 (${soldOutText || '일시품절'})` : '';

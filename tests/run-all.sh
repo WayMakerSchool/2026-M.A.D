@@ -13,7 +13,7 @@ else
 fi
 
 fail=0
-for t in tests/price-sanity.test.js tests/dark-pattern.test.js tests/worker.test.js; do
+for t in tests/price-sanity.test.js tests/dark-pattern.test.js tests/worker.test.js tests/sidebar-price.test.js; do
   echo "── $t ────────────────────────────────"
   RUN "$t" || fail=1
   echo
