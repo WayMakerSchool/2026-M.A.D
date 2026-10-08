@@ -34,8 +34,10 @@ function match(text) {
 const POSITIVE = [
   ['카운트다운',        '이 가격 남은 시간 3분 12초', 'dp-urgency'],
   ['마감 임박',         '오늘 자정 마감! 놓치지 마세요', 'dp-urgency'],
-  ['가짜 사회적 증거',  '지금 내 지역 48명 구매 성공', 'dp-social'],
-  ['조회수 압박',       '지금 127명이 이 상품을 보고 있어요', 'dp-social'],
+  ['가짜 사회적 증거',  '지금 내 지역 48명 구매 성공', 'dp-social-sales'],
+  ['조회수 압박',       '지금 127명이 이 상품을 보고 있어요', 'dp-social-live'],
+  ['플랫폼 판매 집계',  '한 달간 8,000명 이상 구매했어요', 'dp-social-sales'],
+  ['장바구니 실시간',   '지금 32명이 장바구니에 담았어요', 'dp-social-live'],
   ['재고 압박',         '품절 임박! 단 3개 남음', 'dp-stock'],
   ['수량 압박',         '이제 2개 밖에 남았어요', 'dp-stock'],
   ['숨은 자동결제',     '첫 달 무료 이후 매월 자동 결제됩니다', 'dp-subscription'],
@@ -77,6 +79,29 @@ for (const [name, text] of NEGATIVE) {
   if (!ok) failed++;
   lines.push('  ' + (ok ? 'PASS  ' : 'FAIL  ') + name + (ok ? '' : '  →  오탐: ' + hits.join(', ')));
   if (!ok) lines.push('        문구: ' + text);
+}
+
+// ── 실시간/집계 상호 배제 ─────────────────────────────────────
+// 집계("N명 구매")는 리뷰 수로 검증해 제외할 수 있지만 실시간("N명이 보는 중")은 검증
+// 불가라 무조건 유지된다. 한 문구가 두 규칙에 모두 걸리면 집계를 검증으로 걸러도
+// 실시간 경고가 남아 분리한 의미가 없어지므로, 서로의 규칙에 걸리지 않는지 본다.
+lines.push('');
+lines.push('  [실시간/집계 상호 배제]');
+const EXCLUSION_CASES = [
+  ['집계 문구는 live 에 안 걸림',    '지금 내 지역 48명 구매 성공', 'dp-social-live'],
+  ['실시간 문구는 sales 에 안 걸림', '지금 127명이 이 상품을 보고 있어요', 'dp-social-sales'],
+  // "구매 중"은 두 규칙의 동사군이 겹치던 지점 — 집계 쪽 부정 전방탐색 (?!\s*중) 으로 제외했다
+  ['"구매 중"은 sales 에 안 걸림',   '지금 12명이 구매 중이에요',          'dp-social-sales', 'dp-social-live'],
+];
+let exChecked = 0;
+// 네 번째 값(mustId)이 있으면 그 규칙에는 반드시 걸려야 한다 — 양쪽 다 빠지는 미탐도 함께 막는다
+for (const [name, text, mustNotId, mustId] of EXCLUSION_CASES) {
+  exChecked++;
+  const hits = match(text);
+  const ok = !hits.includes(mustNotId) && (!mustId || hits.includes(mustId));
+  if (!ok) failed++;
+  lines.push('  ' + (ok ? 'PASS  ' : 'FAIL  ') + name + '  →  ' + (hits.join(', ') || '(탐지 없음)'));
+  if (!ok) lines.push('        걸리면 안 됨: ' + mustNotId + (mustId ? '  / 걸려야 함: ' + mustId : '') + '   |  문구: ' + text);
 }
 
 // ── 판정 메타데이터 완결성 ─────────────────────────────────────
@@ -142,7 +167,78 @@ for (const [name, input, want] of CD_CASES) {
   lines.push('  ' + (ok ? 'PASS  ' : 'FAIL  ') + name + '  "' + input + '" → ' + got + (ok ? '' : '  (기대: ' + want + ')'));
 }
 
-const total = POSITIVE.length + NEGATIVE.length + metaChecked + evChecked + cdChecked;
+// ── 판매 집계 교차검증 ────────────────────────────────────────
+// content-script.js 의 assessSalesClaim 을 원본에서 잘라내 검증한다.
+// 함수가 참조하는 SALES_PER_REVIEW_MAX(리뷰 1건당 구매 상한)는 소스의 값 20 을 그대로 주입한다.
+const asStart = src.indexOf('const assessSalesClaim = (evidence, reviewCount) => {');
+const asEnd = src.indexOf('\n};', asStart);
+if (asStart < 0 || asEnd < 0) throw new Error('assessSalesClaim 를 찾지 못했습니다.');
+const assessSalesClaim = new Function(
+  'SALES_PER_REVIEW_MAX',
+  'return ' + src.slice(asStart + 'const assessSalesClaim = '.length, asEnd + 2)
+)(20);
+
+lines.push('');
+lines.push('  [판매 집계 교차검증]');
+// [설명, 근거 문구, 리뷰 수, 기대 verdict, 기대 n]
+const SALES_CASES = [
+  ['쿠팡 공식 집계(리뷰 11,394건)', '한 달간 8,000명 이상 구매했어요', 11394, 'corroborated', 8000],
+  ['리뷰 3건에 12,000명',          '12,000명이 구매했어요',          3,     'suspicious',   12000],
+  ['리뷰 수 없음',                 '500명이 구매했어요',             null,  'unverifiable', 500],
+  ['리뷰 2건에 48명',              '지금 내 지역 48명 구매 성공',     2,     'suspicious',   48],
+  ['숫자 없는 문구',               '구매했어요',                     100,   'unknown',      null],
+  ['리뷰 0건에 60명',              '60명이 구매했어요',              0,     'suspicious',   60],
+  ['리뷰 0건에 30명',              '30명이 구매했어요',              0,     'unverifiable', 30],
+];
+let salesChecked = 0;
+for (const [name, text, reviews, wantVerdict, wantN] of SALES_CASES) {
+  salesChecked++;
+  const got = assessSalesClaim(text, reviews);
+  const ok = got.verdict === wantVerdict && got.n === wantN;
+  if (!ok) failed++;
+  lines.push('  ' + (ok ? 'PASS  ' : 'FAIL  ') + name + '  →  ' + got.verdict + ' (n=' + got.n + ')'
+    + (ok ? '' : '  (기대: ' + wantVerdict + ', n=' + wantN + ')'));
+}
+
+// ── 리뷰 수 파서 (판매 집계 교차검증의 기준값) ──────────────────
+// content-script.js 의 parseReviewCountText 를 원본에서 잘라내 검증한다. 이 값이 틀리면
+// 쿠팡 "한 달간 8,000명 이상 구매"(리뷰 11,394건) 같은 공식 집계를 과장으로 오판한다.
+// 숫자가 키워드 앞("11,394 개 상품평")이든 뒤("리뷰 1,024")든 읽고, 평점(4.5)은 리뷰 수로 쓰지 않아야 한다.
+const rcStart = src.indexOf('const parseReviewCountText = (raw) => {');
+const rcEnd = src.indexOf('\n};', rcStart);
+if (rcStart < 0 || rcEnd < 0) throw new Error('parseReviewCountText 를 찾지 못했습니다.');
+const parseReviewCountText = new Function(
+  'return ' + src.slice(rcStart + 'const parseReviewCountText = '.length, rcEnd + 2)
+)();
+
+lines.push('');
+lines.push('  [리뷰 수 파서]');
+// [설명, 입력, 기대 리뷰 수 (null = 리뷰 수로 읽으면 안 됨)]
+const RC_CASES = [
+  ['쿠팡 숫자 앞',          '11,394 개 상품평',                 11394],
+  ['평점+괄호 안 숫자 앞',  '★4.5 (11,394개 상품평)',           11394],
+  ['키워드 뒤',             '리뷰 1,024',                       1024],
+  ['키워드 뒤 괄호',        '상품평(11,394)',                   11394],
+  ['평점과 함께',           '평점 4.7 · 상품평 1,024건',        1024],
+  ['평점은 리뷰 수 아님',   '리뷰 4.5',                         null],
+  ['판매 집계는 리뷰 아님', '한 달간 8,000명 이상 구매했어요',  null],
+  ['빈 문자열',             '',                                 null],
+  ['null',                  null,                               null],
+  ['구매평 N건',            '구매평 19건',                      19],
+  ['판매자 평가',           '판매자 평가 19',                   19],
+  ['리뷰 0건',              '후기 0',                           0],
+];
+let rcChecked = 0;
+for (const [name, input, want] of RC_CASES) {
+  rcChecked++;
+  let got;
+  try { got = parseReviewCountText(input); } catch (e) { got = 'ERROR: ' + e.message; }
+  const ok = got === want;
+  if (!ok) failed++;
+  lines.push('  ' + (ok ? 'PASS  ' : 'FAIL  ') + name + '  ' + JSON.stringify(input) + ' → ' + got + (ok ? '' : '  (기대: ' + want + ')'));
+}
+
+const total = POSITIVE.length + NEGATIVE.length + metaChecked + evChecked + cdChecked + exChecked + salesChecked + rcChecked;
 lines.push('');
 lines.push(failed === 0 ? '  ✅ ' + total + '개 전부 통과' : '  ❌ ' + total + '개 중 ' + failed + '건 실패');
 

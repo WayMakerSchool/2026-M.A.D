@@ -454,6 +454,18 @@ const ratingFromStarWidth = () => {
   return null;
 };
 
+// 리뷰 수 텍스트 파서 — 숫자가 키워드 앞("11,394 개 상품평", 쿠팡)이든 뒤("리뷰 1,024", "상품평(11,394)")든 읽는다.
+// 소수("4.5")는 평점이므로 리뷰 수로 쓰지 않는다. 판매 집계 교차검증의 기준값이라, 틀리면 공식 집계를 과장으로 오판한다.
+const parseReviewCountText = (raw) => {
+  const t = String(raw || '');
+  const NUM = '([0-9]{1,3}(?:,[0-9]{3})+|[0-9]{1,7})';
+  const before = t.match(new RegExp('(?<![0-9.,])' + NUM + '\\s*(?:개|건)?\\s*(?:상품평|구매평|리뷰|후기)'));
+  if (before) return Number(before[1].replace(/,/g, ''));
+  const after = t.match(new RegExp('(?:상품평|구매평|리뷰|후기|평가)\\s*[(\\[]?\\s*' + NUM + '(?![0-9.])'));
+  if (after) return Number(after[1].replace(/,/g, ''));
+  return null;
+};
+
 // 판매자 신뢰 신호 수집 — 셀렉터 우선, body 텍스트 regex 폴백
 const collectSellerSignals = () => {
   const bodyText = document.body?.innerText || '';
@@ -475,14 +487,28 @@ const collectSellerSignals = () => {
     if (m) sellerRating = Number(m[1]);
   }
 
+  // 리뷰 수 — 판매 집계("한 달간 8,000명 이상 구매") 교차검증의 기준값이라 틀리면 공식 집계를
+  // 과장으로 오판한다. 예전에는 리뷰 영역 텍스트의 '첫 정수'를 읽어 평점 "4.5" 가 앞에 오면 리뷰 4건으로
+  // 오인했고, body 폴백은 '키워드 뒤 숫자'만 읽어 쿠팡 "11,394 개 상품평"(숫자가 앞)을 놓쳤다. 순서:
+  //   a) 전용 카운트 요소(.count-num, .review-count)의 텍스트가 숫자뿐("(11,394)", "11,394개")이면 그 정수.
+  //      숫자 외 내용이 섞여 있으면 평점일 수 있으니 여기서는 쓰지 않고 키워드 파서로 넘긴다.
+  //      queryFirst 는 첫 셀렉터에 텍스트가 있으면 거기서 멈추므로, 두 셀렉터를 따로 확인한다.
+  //   b) 리뷰 영역 텍스트를 parseReviewCountText 로 — 키워드에 붙은 숫자만, 소수(평점)는 제외
+  //   c) body 텍스트를 같은 파서로
   let reviewCount = null;
-  const reviewText = queryFirst(['.count-num', '.review-count', '.js_reviewArea', '[class*="review"]', '[class*="count"]']);
-  const rcSel = reviewText && reviewText.replace(/,/g, '').match(/([0-9]{1,7})/);
-  if (rcSel) reviewCount = Number(rcSel[1]);
-  if (reviewCount == null) {
-    const m = bodyText.replace(/,/g, '').match(/(?:리뷰|구매평|상품평|평가|후기)\D{0,4}([0-9]{1,7})\s*(?:건|개)?/);
-    if (m) reviewCount = Number(m[1]);
+  for (const sel of ['.count-num', '.review-count']) {
+    const countText = queryFirst([sel]);
+    if (!countText) continue;
+    const bare = countText.replace(/[(),\s개건]/g, '');
+    if (/^[0-9]{1,3}(,[0-9]{3})*$|^[0-9]{1,7}$/.test(bare)) {
+      reviewCount = Number(bare.replace(/,/g, ''));
+      break;
+    }
   }
+  if (reviewCount == null) {
+    reviewCount = parseReviewCountText(queryFirst(['.js_reviewArea', '[class*="review"]', '[class*="count"]']));
+  }
+  if (reviewCount == null) reviewCount = parseReviewCountText(bodyText);
 
   let lowReviewWarning = null;
   const lrw = bodyText.match(/([0-9]{1,4})\s*건\s*이하의\s*평가/);
@@ -510,11 +536,25 @@ const DARK_PATTERN_RULES = [
   { id: 'dp-urgency', re: /(남은\s*시간|마감\s*임박|판매\s*종료\s*임박|곧\s*(마감|종료|품절)|오늘\s*(자정|24시)?\s*마감|지금\s*안\s*사면|[0-9]{1,2}\s*분\s*[0-9]{2}\s*초)/,
     fairType: '시간제한 알림 (압박형)', law: false,
     message: '시간 압박 표시(카운트다운·마감 임박)가 있어요. 실제 마감인지는 알 수 없으니 서두르지 마세요.' },
+  // '다른 소비자의 활동 알림'은 검증 가능성이 달라 두 규칙으로 나눈다.
+  //   dp-social-live   "지금 N명이 보고 있어요" 같은 실시간 활동 — 검증할 방법이 없으니 무조건 경고
+  //   dp-social-sales  "N명 구매" 같은 판매 집계 — 리뷰 수와 교차검증(assessSalesClaim)해 정상 범위면
+  //                    플랫폼 공식 집계로 보고 경고하지 않는다. 쿠팡 "한 달간 8,000명 이상 구매"(리뷰
+  //                    11,394건)를 압박형으로 경고해 베타 테스터가 오탐이라 지적한 사례가 계기.
+  // 한 문구가 두 규칙에 동시에 걸리면 안 된다 — 집계를 검증으로 걸러도 실시간 경고가 남아 분리한
+  // 의미가 없어진다 (tests/dark-pattern.test.js 상호 배제 검사). 동사군이 '구매'에서 겹치므로
+  // ("지금 12명이 구매 중" 은 실시간), 집계 쪽 '구매'에 부정 전방탐색 (?!\s*중) 을 붙여
+  // 실시간의 '구매 중'을 집계에서 제외했다.
   // "127명이 이 상품을 보고 있어요"처럼 '명'과 동사 사이에 수식어가 끼는 경우가 많아
   // 사이에 짧은 구절(최대 12자)을 허용한다. 문장을 넘지 않도록 마침표·줄바꿈은 제외.
-  { id: 'dp-social', re: /([0-9][0-9,]*\s*명(이)?[^.\n]{0,12}?(구매|구입|주문|보고\s*있|담았|참여|신청))/,
+  { id: 'dp-social-live',
+    re: /(지금|현재|실시간)?\s*([0-9][0-9,]*)\s*명(이)?[^.\n]{0,12}?(보고\s*있|보는\s*중|담았|장바구니에\s*담|구매\s*중)/,
     fairType: '다른 소비자의 활동 알림 (압박형)', law: false,
-    message: '“N명 구매/보는 중” 표시가 있어요. 이 숫자는 검증할 수 없으니 실제 리뷰 수와 비교하세요.' },
+    message: '“지금 N명이 보고 있어요” 같은 실시간 활동 표시가 있어요. 이 숫자는 검증할 수 없고, 조급함을 유도하는 데 쓰이기도 해요.' },
+  { id: 'dp-social-sales',
+    re: /([0-9][0-9,]*)\s*명(이)?\s*(이상\s*)?[^.\n]{0,12}?(구매(?!\s*중)|구입|주문|참여|신청)/,
+    fairType: '다른 소비자의 활동 알림 (압박형)', law: false,
+    message: '“N명 구매” 표시가 있어요. 리뷰 수와 비교해 과장인지 확인하세요.' },
   { id: 'dp-stock', re: /((품절|재고)\s*임박|단\s*[0-9]+\s*개?\s*남|마지막\s*[0-9]+\s*개|[0-9]+\s*개?\s*(밖에\s*)?남았)/,
     fairType: '낮은 재고 알림 (압박형)', law: false,
     message: '재고 압박 표시(“품절 임박/N개 남음”)가 있어요. 인위적으로 만들 수 있는 표시이니 조급해하지 마세요.' },
@@ -531,6 +571,18 @@ const DARK_PATTERN_RULES = [
     fairType: '취소·탈퇴 방해 (방해형)', law: true,
     message: '가입은 클릭 한 번인데 해지는 전화·상담만 허용하는 구조예요(취소 방해). 가입 전 해지 방법을 확인하세요.' },
 ];
+
+// 판매 집계 표시가 리뷰 수와 맞는지 본다. 리뷰 작성률은 통상 구매의 5~20% 이므로
+// 리뷰 1건당 구매 20건까지는 정상 범위로 본다. 그 범위면 플랫폼 공식 집계로 보고 경고하지 않는다.
+const SALES_PER_REVIEW_MAX = 20;
+const assessSalesClaim = (evidence, reviewCount) => {
+  const m = String(evidence || '').replace(/,/g, '').match(/([0-9]+)\s*명/);
+  const n = m ? Number(m[1]) : null;
+  if (n == null) return { n: null, verdict: 'unknown' };
+  if (reviewCount == null || !(reviewCount >= 0)) return { n, verdict: 'unverifiable' };
+  if (reviewCount === 0) return { n, verdict: n > 50 ? 'suspicious' : 'unverifiable' };
+  return { n, verdict: n <= reviewCount * SALES_PER_REVIEW_MAX ? 'corroborated' : 'suspicious' };
+};
 
 // 라벨 텍스트 추출 — for 속성, 감싼 label, aria-label, 부모 텍스트 순으로 시도
 const labelTextFor = (el) => {
@@ -614,7 +666,9 @@ const findEvidenceElement = (snippet) => {
 // 시간 관측으로 evidenceLevel 2(기만 확인)에 도달한 판정 — id → finding
 const OBSERVED_FINDINGS = new Map();
 
-const detectDarkPatterns = () => {
+// ctx.reviewCount — 호출부가 collectSellerSignals() 로 구한 리뷰 수. 판매 집계("N명 구매")
+// 표시를 이 값과 교차검증하기 위해 받는다. 없으면 검증 불가로 두고 경고는 유지한다.
+const detectDarkPatterns = (ctx = {}) => {
   const text = (document.body?.innerText || '').replace(/\s+/g, ' ');
   const out = [];
   for (const r of DARK_PATTERN_RULES) {
@@ -625,11 +679,26 @@ const detectDarkPatterns = () => {
       // 근거 요소가 리뷰·추천·광고 영역이면 오탐으로 보고 버린다 (판정 범위 한정)
       const host = findEvidenceElement(evidence);
       if (host && (isInPromoSection(host) || host.closest(DP_EXCLUDE_SELECTOR))) continue;
-      out.push({
+      const finding = {
         id: r.id, evidenceLevel: 1, method: 'rule-text',
         fairType: r.fairType, law: !!r.law,
         evidence, message: r.message,
-      });
+      };
+      // 판매 집계는 리뷰 수와 교차검증한다. 정상 범위(corroborated)면 플랫폼 공식 집계로 보고
+      // 결과에서 뺀다. 실시간 활동(dp-social-live)은 검증할 수단이 없어 그대로 둔다.
+      if (r.id === 'dp-social-sales') {
+        const c = assessSalesClaim(evidence, ctx.reviewCount);
+        if (c.verdict === 'corroborated') continue;
+        const nText = c.n != null ? c.n.toLocaleString('ko-KR') : 'N';
+        if (c.verdict === 'suspicious') {
+          const rText = Number(ctx.reviewCount).toLocaleString('ko-KR');
+          finding.message = `“${nText}명 구매” 표시가 리뷰 ${rText}건에 비해 지나치게 커요. 과장된 집계일 수 있어요.`;
+        } else {
+          finding.message = `“${nText}명 구매” 표시가 있어요. 리뷰 수를 찾지 못해 검증할 수 없었어요.`;
+        }
+        finding.corroboration = { n: c.n, reviewCount: ctx.reviewCount ?? null, verdict: c.verdict };
+      }
+      out.push(finding);
     } catch (_) {}
   }
   const pre = detectPreselectedOptIns();
@@ -1139,7 +1208,7 @@ const collectShoppingData = () => {
     priceBlockText: getPriceBlockText(),
     priceVerified: _origVerified,
     priceSanity: priceInfo,
-    darkPatterns: detectDarkPatterns(),
+    darkPatterns: detectDarkPatterns({ reviewCount: seller.reviewCount }),
     // 판매 가능 여부·규격 — 품절 상품을 추천/최저가로 다루지 않기 위해
     ...(() => { const so = detectSoldOut(); return { soldOut: so.soldOut, soldOutText: so.text }; })(),
     specText: getSpecText(),
@@ -1275,7 +1344,8 @@ if (SHOPPING_HOSTS.some(h => location.hostname.includes(h))) {
 // 기존에는 사이드바가 데이터를 요청할 때 딱 1회만 검사했다. 카운트다운·팝업·
 // 미리 체크된 항목은 대부분 그 뒤에 나타나므로 '실시간'이라 부를 수 없었다.
 // DOM 변화를 관찰하다가 새로 나타난 패턴이 있으면 페이지 위에 바로 경고를 띄운다.
-const DP_WATCH = { seen: new Set(), el: null, mutedUntilReload: false };
+// lastSig — 마지막으로 그린 경고의 규칙 id 집합(정렬 후 '|' 연결). 집합이 바뀔 때만 다시 그린다.
+const DP_WATCH = { seen: new Set(), el: null, mutedUntilReload: false, lastSig: '' };
 
 function dismissDarkPatternAlert() {
   if (DP_WATCH.el) { DP_WATCH.el.remove(); DP_WATCH.el = null; }
@@ -1294,7 +1364,7 @@ function renderDarkPatternAlert(items) {
     'background:#fffbeb', 'border:1px solid #fcd34d', 'border-radius:14px',
     'box-shadow:0 10px 30px rgba(0,0,0,0.18)',
     'padding:12px 14px',
-    'font:400 12px/1.5 -apple-system,"Malgun Gothic",sans-serif',
+    'font:400 13px/1.5 -apple-system,"Malgun Gothic",sans-serif',
     'color:#78350f',
   ].join(';');
 
@@ -1307,7 +1377,7 @@ function renderDarkPatternAlert(items) {
   title.textContent = confirmedCount > 0
     ? `⚠ 다크패턴 신호 ${items.length}건 · 관측 확인 ${confirmedCount}건`
     : `⚠ 다크패턴 신호 ${items.length}건`;
-  title.style.cssText = 'font:800 12px/1.2 -apple-system,"Malgun Gothic",sans-serif;color:#b45309';
+  title.style.cssText = 'font:800 13px/1.2 -apple-system,"Malgun Gothic",sans-serif;color:#b45309';
 
   const close = document.createElement('button');
   close.textContent = '✕';
@@ -1379,7 +1449,7 @@ function renderDarkPatternAlert(items) {
     'margin-top:10px', 'width:100%', 'cursor:pointer',
     'background:#f59e0b', 'border:none', 'border-radius:9px',
     'padding:7px 0', 'color:#fff',
-    'font:800 11px/1 -apple-system,"Malgun Gothic",sans-serif',
+    'font:800 12px/1 -apple-system,"Malgun Gothic",sans-serif',
   ].join(';');
   // 사이드패널 열기는 사용자 제스처를 요구하고 실패할 수 있어, FAB과 동일하게 오버레이를 쓴다
   detail.addEventListener('click', () => { if (!overlayContainer) createOverlay(); });
@@ -1397,14 +1467,30 @@ function renderDarkPatternAlert(items) {
 
 function runDarkPatternScan() {
   if (DP_WATCH.mutedUntilReload) return;
+  // 판매 집계("N명 구매") 교차검증용 리뷰 수. collectSellerSignals 는 DOM 을 몇 번 질의할 뿐이라
+  // 900ms 디바운스 안에서 부담 없다. 실패해도 경고 자체는 내야 하므로 null 로 두고 진행한다.
+  let reviewCount = null;
+  try { reviewCount = collectSellerSignals().reviewCount; } catch (_) {}
   let found;
-  try { found = detectDarkPatterns(); } catch (_) { return; }
+  try { found = detectDarkPatterns({ reviewCount }); } catch (_) { return; }
   // 시간 압박 표시가 보이면 그때부터 카운트다운 관측을 시작한다 (표시 감지 → 기만 확인 승격 경로)
   if (found.some(f => f.id === 'dp-urgency')) startCountdownWatcher();
-  const fresh = found.filter(f => !DP_WATCH.seen.has(f.id));
-  if (!fresh.length) return;               // 새로 나타난 게 없으면 다시 그리지 않는다
-  fresh.forEach(f => DP_WATCH.seen.add(f.id));
-  renderDarkPatternAlert(found);           // 누적 전체를 보여준다
+  // 다시 그리는 기준은 '지금 걸린 규칙 id 집합이 바뀌었는가'다. 예전에는 새 id 가 생길 때만 그려서,
+  // 리뷰 수가 늦게 로드돼 판매 집계(dp-social-sales)가 교차검증(corroborated)으로 빠져도 처음 띄운
+  // 경고가 화면에 그대로 남았다. 집합이 줄거나 비는 것도 변화로 보고 다시 그리거나 닫는다.
+  // id 만 비교하면 판정이 바뀌어도(예: 리뷰 수가 늦게 로드돼 '검증 불가' → '과장 의심') 화면이 옛 문구로 남는다.
+  // id 와 문구를 함께 서명에 넣어, 내용이 바뀌면 다시 그린다.
+  const sig = found.map(f => f.id + '#' + (f.message || '')).sort().join('|');
+  if (sig === DP_WATCH.lastSig) return;    // 같은 집합이면 다시 그리지 않는다 (MutationObserver 과호출 방지)
+  // seen 은 지금 다른 곳에서 읽지 않지만, 이 페이지에서 한 번이라도 걸린 규칙의 기록으로 남겨 둔다
+  found.forEach(f => DP_WATCH.seen.add(f.id));
+  if (!found.length) {
+    dismissDarkPatternAlert();
+    DP_WATCH.lastSig = sig;
+    return;
+  }
+  renderDarkPatternAlert(found);           // 현재 걸린 전체를 보여준다
+  DP_WATCH.lastSig = sig;
 }
 
 function setupDarkPatternWatcher() {

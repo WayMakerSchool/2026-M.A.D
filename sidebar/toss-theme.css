@@ -43,8 +43,8 @@
   /* ── 타이포 ── */
   --font-sans: "Pretendard Variable", Pretendard, -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Segoe UI", Roboto, "Noto Sans KR", sans-serif;
   --default-font-family: var(--font-sans);
-  --text-xs: 0.8125rem;  --text-xs--line-height: 1.45;   /* 13px */
-  --text-sm: 0.9rem;     --text-sm--line-height: 1.45;   /* 14.4px */
+  --text-xs: 0.875rem;   --text-xs--line-height: 1.45;   /* 14px — 베타 피드백(글씨 작음)으로 한 단계 */
+  --text-sm: 0.9375rem;  --text-sm--line-height: 1.45;   /* 15px */
   --text-base: 1rem;     --text-base--line-height: 1.5;
   --text-lg: 1.1875rem;  --text-lg--line-height: 1.35;   /* 19px */
   --text-xl: 1.375rem;   --text-2xl: 1.625rem;
@@ -53,16 +53,21 @@
 html, body, #root { font-family: var(--font-sans); color: #191F28; letter-spacing: -0.01em; -webkit-font-smoothing: antialiased; }
 input, textarea, select, button { font-family: inherit; letter-spacing: inherit; }
 
-/* 마이크로 텍스트 한 단계 키움 (가독성) */
-.text-\[8px\]    { font-size: 9px; }
-.text-\[9px\]    { font-size: 10px; }
-.text-\[9\.5px\] { font-size: 10.5px; }
-.text-\[10px\]   { font-size: 11px; }
-.text-\[10\.5px\]{ font-size: 11.5px; }
-.text-\[11px\]   { font-size: 12px; }
-.text-\[11\.5px\]{ font-size: 12.5px; }
-.text-\[12px\], .text-\[12\.5px\] { font-size: 13px; }
-.text-\[13px\]   { font-size: 14px; }
+/* 마이크로 텍스트 두 단계 키움 — 베타 피드백: 글씨가 작아 처음 쓰는 사람이 못 읽음.
+   Tailwind v4 유틸리티는 @layer utilities 안에 있고 이 파일은 레이어 밖이라 선언 순서와 무관하게 이긴다 (!important 불필요).
+   임의값 text-[Npx] 는 font-size 만 내고 행간은 html 의 1.5 를 물려받으므로 글자가 커진 만큼 줄 높이도 늘어난다.
+   뱃지·칩 높이가 과하게 불지 않게 임의값 텍스트의 행간만 1.35 로 묶는다. */
+.text-\[8px\]    { font-size: 11px; }
+.text-\[9px\]    { font-size: 11px; }
+.text-\[9\.5px\] { font-size: 11.5px; }
+.text-\[10px\]   { font-size: 12px; }
+.text-\[10\.5px\]{ font-size: 12px; }
+.text-\[11px\]   { font-size: 13px; }
+.text-\[11\.5px\]{ font-size: 13px; }
+.text-\[12px\], .text-\[12\.5px\] { font-size: 14px; }
+.text-\[13px\]   { font-size: 14.5px; }
+/* leading-* 를 함께 쓴 요소는 제외 — 이 규칙은 레이어 밖이라 @layer utilities 의 leading-none/tight/snug/relaxed 를 덮어써 번들이 의도한 행간을 깨뜨린다. */
+[class*="text-\["]:not([class*="leading-"]) { line-height: 1.35; }
 
 /* 굵기: 토스는 800보다 700을 씀 — 과한 extrabold를 한 단계 낮춤 */
 .font-extrabold { font-weight: 700; }

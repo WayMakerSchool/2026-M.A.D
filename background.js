@@ -261,20 +261,39 @@ async function geminiRaw(prompt, generationConfig, signal, tools) {
     console.warn('[ShoMate] 백엔드 호출 실패, 폴백:', e?.message || e);
   }
 
+  // fetch 가 TypeError('Failed to fetch') 로 끝나면 어느 경로·모델에서 막혔는지 알 길이 없어
+  // 화면에 "AI 분석 실패: Failed to fetch" 만 남는다. 경로·모델을 붙여 다시 던진다.
+  // 그 외 에러(geminiDirect 의 'Gemini 404: ...', Abort 등)는 그대로 올린다.
+  const isNetworkError = (e) => e instanceof TypeError && /Failed to fetch|NetworkError/.test(String(e?.message || ''));
+  const connectError = (route, e) => new Error(
+    'AI 서버에 연결하지 못했습니다 (경로: ' + route + ', 모델: ' + model + '). 네트워크·VPN·광고차단 확장을 확인하세요. 원인: ' + e.message
+  );
   const userKey = await getUserApiKey();
   if (userKey) {
-    return tag(await geminiDirect(userKey, model, prompt, generationConfig, rawConfig, tools || null, signal), '본인 키');
+    try {
+      return tag(await geminiDirect(userKey, model, prompt, generationConfig, rawConfig, tools || null, signal), '본인 키');
+    } catch (e) {
+      if (isNetworkError(e)) throw connectError('본인 키', e);
+      throw e;
+    }
   }
   const proxyUrl = await getProxyUrl();
   if (proxyUrl) {
-    const res = await fetch(proxyUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt, generationConfig, model, ...extra }),
-      signal,
-    });
-    if (!res.ok) { const e = await res.text().catch(() => ''); throw new Error(`Proxy ${res.status}: ${e.slice(0, 200)}`); }
-    return tag(await res.json(), '프록시');
+    let proxyHost = proxyUrl;
+    try { proxyHost = new URL(proxyUrl).hostname; } catch (_) {}
+    try {
+      const res = await fetch(proxyUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt, generationConfig, model, ...extra }),
+        signal,
+      });
+      if (!res.ok) { const e = await res.text().catch(() => ''); throw new Error(`Proxy ${res.status}: ${e.slice(0, 200)}`); }
+      return tag(await res.json(), '프록시');
+    } catch (e) {
+      if (isNetworkError(e)) throw connectError('프록시 ' + proxyHost, e);
+      throw e;
+    }
   }
   // 여기까지 왔다면 쓸 수 있는 경로가 하나도 없다.
   // 코드에 키를 박아두는 폴백은 의도적으로 두지 않는다 (번들 = 공개 파일).
@@ -494,6 +513,14 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
   if (message.type === 'geminiAnalyze') {
+    // Q&A 가 "이 페이지에 무엇이 있고 없는지" 알고 답하도록 분석 입력을 남겨 둔다.
+    // storage.session 은 storage 권한에 포함되고 브라우저를 닫으면 사라진다 —
+    // 상품 페이지 텍스트를 디스크에 남기지 않으려는 의도. 없는 환경이면 조용히 건너뛴다.
+    try {
+      const { productName, currentPrice, detectedMall, rawText, soldOut, soldOutText } = message.data || {};
+      const ctx = { productName, currentPrice, detectedMall, rawText: String(rawText || '').slice(0, 4000), soldOut, soldOutText, savedAt: Date.now() };
+      Promise.resolve(chrome.storage.session.set({ lastAnalysisCtx: ctx })).catch(() => {});
+    } catch (_) {}
     callGemini(message.data)
       .then(sendResponse)
       .catch(err => sendResponse({ error: err.message || String(err) }));
@@ -664,7 +691,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 });
 
 // ── Gemini AI 분석 ──────────────────────────────────────────────
-
+// 가격은 내려보내지 않는다. 사이드바는 sameProductAlts/alternativeProducts 중 가격 필드가 0 보다 큰
+// 항목만 카드로 만드므로, 가격을 빼면 "약 1,650,000원 · AI 추정 · 실제 가격 아님" 카드가 생기지
+// 않는다 — 의도된 동작이다. 베타에서 그 추정가가 네이버에 존재하지 않는 값이라 신뢰를 깼다.
+// 실제 가격은 네이버 검색 API(searchShoppingPrices)와 AI 실검색(findRealListings)에서만 온다.
 async function callGemini({ productName, currentPrice, detectedMall, rawText = '', soldOut = false, soldOutText = '' }) {
   const stockLine = soldOut ? `\n판매 상태: 현재 구매 불가 (${soldOutText || '일시품절'})` : '';
   const stockRule = soldOut ? '\n[중요] 이 상품은 지금 살 수 없다. recommendation과 aiPros에서 구매를 권하지 말고, 재입고 확인이나 대안 검토를 권하라.' : '';
@@ -689,26 +719,24 @@ ${snippet}${stockRule}
   "priceAssessment": "저렴 또는 적당 또는 비쌈",
   "recommendation": "이 상품 구매에 대한 한 문장 추천 의견",
   "sameProductAlts": [
-    {"platform": "네이버쇼핑", "estimatedPrice": 숫자, "reason": "최저가 검색", "searchQuery": "정확한 상품명"},
-    {"platform": "쿠팡", "estimatedPrice": 숫자, "reason": "로켓배송 가능", "searchQuery": "정확한 상품명"},
-    {"platform": "11번가", "estimatedPrice": 숫자, "reason": "포인트 적립", "searchQuery": "정확한 상품명"}
+    {"platform": "네이버쇼핑", "reason": "최저가 검색", "searchQuery": "정확한 상품명"},
+    {"platform": "쿠팡", "reason": "로켓배송 가능", "searchQuery": "정확한 상품명"},
+    {"platform": "11번가", "reason": "포인트 적립", "searchQuery": "정확한 상품명"}
   ],
   "alternativeProducts": [
-    {"productName": "다른 브랜드 경쟁 상품명 1", "platform": "네이버쇼핑", "estimatedPrice": 숫자, "reason": "가성비 대안", "searchQuery": "검색어"},
-    {"productName": "다른 브랜드 경쟁 상품명 2", "platform": "쿠팡", "estimatedPrice": 숫자, "reason": "인기 대안", "searchQuery": "검색어"},
-    {"productName": "다른 브랜드 경쟁 상품명 3", "platform": "11번가", "estimatedPrice": 숫자, "reason": "고성능 대안", "searchQuery": "검색어"}
+    {"productName": "다른 브랜드 경쟁 상품명 1", "platform": "네이버쇼핑", "reason": "가성비 대안", "searchQuery": "검색어"},
+    {"productName": "다른 브랜드 경쟁 상품명 2", "platform": "쿠팡", "reason": "인기 대안", "searchQuery": "검색어"},
+    {"productName": "다른 브랜드 경쟁 상품명 3", "platform": "11번가", "reason": "고성능 대안", "searchQuery": "검색어"}
   ]
 }
 
 반드시 지켜야 할 규칙 (위반 시 사용 불가):
-1. sameProductAlts.estimatedPrice는 현재 판매가(${Number(currentPrice).toLocaleString('ko-KR')}원)보다 낮거나 같아야 함. 더 비싼 값은 절대 금지. 확실하지 않으면 현재가와 동일하게.
+1. 가격을 추정하거나 지어내지 마라. 가격 필드는 어떤 이름으로도 출력하지 않는다.
 2. alternativeProducts는 현재 상품과 완전히 다른 브랜드·모델의 실제 경쟁 상품이어야 함 (같은 상품명 변형 금지)
    예: 나이키 티셔츠 → 아디다스 티셔츠, 언더아머 티셔츠, 뉴발란스 티셔츠
    예: 갤럭시 버즈 → 소니 WF-C700N, 에어팟 프로, 보스 QuietComfort Earbuds
-3. alternativeProducts.estimatedPrice는 현재 판매가(${Number(currentPrice).toLocaleString('ko-KR')}원) 기준 ±30% 범위 내
-4. 모든 숫자는 JSON 숫자형(따옴표 없이)으로 작성
-5. searchQuery는 해당 플랫폼에서 실제로 검색할 구체적인 상품명
-6. sameProductAlts의 가격이 현재가보다 높으면 JSON 생성 실패로 간주하고 재작성할 것`;
+3. 모든 숫자는 JSON 숫자형(따옴표 없이)으로 작성
+4. searchQuery는 해당 플랫폼에서 실제로 검색할 구체적인 상품명`;
 
   const data = await geminiRaw(prompt, { temperature: 0.4, maxOutputTokens: 1024, thinkingConfig: { thinkingBudget: 0 } });
   console.log('[ShoMate] Gemini 성공:', data.candidates?.[0]?.content?.parts?.[0]?.text?.slice(0, 100));
@@ -716,7 +744,17 @@ ${snippet}${stockRule}
 
   try {
     const m = text.match(/\{[\s\S]*\}/);
-    return JSON.parse(m ? m[0] : text);
+    const parsed = JSON.parse(m ? m[0] : text);
+    // 프롬프트로 금지해도 모델이 가격 키를 내보낼 수 있다. 두 배열의 항목에서 이름이 price 로
+    // 끝나는 키(estimated 접두어 포함)를 전부 지운다 — 추정가가 사이드바 카드로 새지 않게.
+    for (const key of ['sameProductAlts', 'alternativeProducts']) {
+      if (!Array.isArray(parsed?.[key])) continue;
+      for (const it of parsed[key]) {
+        if (!it || typeof it !== 'object') continue;
+        for (const k of Object.keys(it)) if (/price$/i.test(k)) delete it[k];
+      }
+    }
+    return parsed;
   } catch {
     return { aiSummary: text.slice(0, 300), aiPros: [], aiCons: [], priceAssessment: '적당', recommendation: '' };
   }
@@ -724,21 +762,76 @@ ${snippet}${stockRule}
 
 // ── AI Q&A 채팅 ────────────────────────────────────────────────
 
+// 분석 때 저장한 페이지 맥락. 상품명이 같거나(공백·대소문자 무시, 앞 30자) 30분 이내 것이면 쓴다 —
+// 사이드바가 상품명을 조금 다르게 넘겨도 방금 분석한 페이지라면 같은 맥락으로 본다.
+const ANALYSIS_CTX_TTL_MS = 30 * 60 * 1000;
+async function getAnalysisCtx(productName) {
+  try {
+    const { lastAnalysisCtx: ctx } = await chrome.storage.session.get('lastAnalysisCtx');
+    if (!ctx || typeof ctx !== 'object') return null;
+    const norm = (v) => String(v || '').replace(/\s+/g, '').toLowerCase().slice(0, 30);
+    const sameName = !!productName && !!ctx.productName && norm(productName) === norm(ctx.productName);
+    const fresh = Date.now() - Number(ctx.savedAt || 0) < ANALYSIS_CTX_TTL_MS;
+    return sameName || fresh ? ctx : null;
+  } catch { return null; }
+}
+
+// Q&A 프롬프트에 넣을 "페이지에서 관측된 사실" 블록. 규칙 판정과 리뷰 수 추출은 URL 분석과
+// 같은 함수를 써서, 사이드바 경고와 AI 답이 서로 다른 말을 하지 않게 한다.
+// "없는 표시" 에 올리는 유형 — 사용자가 없는 것을 물었을 때 AI 가 "없다" 고 단언할 근거.
+const DP_ABSENCE_LABELS = [
+  ['dp-social-live', '실시간 활동 표시'], ['dp-urgency', '카운트다운'], ['dp-stock', '재고 임박'],
+  ['dp-subscription', '자동결제'], ['dp-confirmshaming', '확인 쉐이밍'], ['dp-roachmotel', '취소 방해'],
+];
+function buildChatContextBlock(ctx) {
+  const text = String(ctx.rawText || '');
+  const { reviewCount, rating } = extractReviewSignals(text);
+  const found = buildDarkPatternWarningsFromHtml(text, reviewCount);
+  const foundIds = new Set(found.map(w => w.id));
+  const fmt = (n) => Number(n).toLocaleString('ko-KR');
+  const lines = [
+    '[페이지에서 관측된 사실 — 이 범위 안에서만 답하라]',
+    `상품: ${ctx.productName || '미확인'}, 쇼핑몰: ${ctx.detectedMall || '미확인'}, 표시 가격: ${ctx.currentPrice ? fmt(ctx.currentPrice) + '원' : '미확인'}, ` +
+      `리뷰: ${reviewCount != null ? fmt(reviewCount) + '건' : '미확인'}, 평점: ${rating != null ? rating.toFixed(1) : '미확인'}, 품절: ${ctx.soldOut ? '예' : '아니오'}`,
+    '발견된 표시:',
+    ...(found.length ? found.map(w => `- [${w.fairType}] ${w.evidence} — ${w.message}`) : ['- 없음']),
+  ];
+  // 리뷰 수와 맞는 판매 집계는 경고 목록에서 빠진다. 그래도 AI 가 "다크패턴 아님" 을 숫자로 말할 수 있게 따로 적는다.
+  const salesRule = BG_DARK_PATTERN_RULES.find(r => r.id === 'dp-social-sales');
+  const sm = salesRule ? htmlToText(text).match(salesRule.re) : null;
+  if (sm && !foundIds.has('dp-social-sales')) {
+    const a = assessSalesClaim(sm[0], reviewCount);
+    if (a.verdict === 'corroborated') {
+      lines.push(`판매 집계: “${fmt(a.n)}명 구매” 표시 — 리뷰 ${fmt(reviewCount)}건 대비 통상 범위(리뷰 1건당 구매 ${SALES_PER_REVIEW_MAX}건 이내)라 플랫폼 공식 집계로 봄`);
+    }
+  }
+  const absent = DP_ABSENCE_LABELS.filter(([id]) => !foundIds.has(id)).map(([, label]) => label);
+  lines.push(`없는 표시: ${absent.length ? absent.join('·') : '없음'}`);
+  return lines.join('\n');
+}
+
 async function callGeminiChat(productName, question) {
   const today = new Date().toLocaleDateString('ko-KR', { year: 'numeric', month: 'long', day: 'numeric' });
   const langName = await getLangName();
+  // 맥락이 없으면(분석 전·세션 만료) 기존 프롬프트 그대로 — 블록과 추가 규칙 둘 다 빈 문자열
+  const ctx = await getAnalysisCtx(productName);
+  const ctxBlock = ctx ? `\n${buildChatContextBlock(ctx)}\n` : '';
+  const ctxRules = ctx ? `
+- 사용자가 페이지에 없는 표시에 대해 물으면 "이 페이지에는 그 표시가 없다"고 분명히 말하고, 대신 실제로 있는 표시를 알려줘라.
+- 플랫폼 공식 집계(예: 쿠팡 "한 달간 N명 구매", 네이버 "구매 N건")는 리뷰 수와 비교해 판단하고, 비교 숫자를 답에 포함하라. 리뷰 수 대비 통상 범위(리뷰 1건당 구매 ${SALES_PER_REVIEW_MAX}건 이내)면 다크패턴이 아니라고 말하라.
+- 추측을 사실처럼 말하지 마라.` : '';
   const prompt = `당신은 쇼핑 전문가 AI 어시스턴트입니다. 오늘 날짜는 ${today}입니다. 최신 출시 제품들(아이폰 17 시리즈, 갤럭시 S25 시리즈 등 2025년 이후 제품 포함)을 알고 있습니다.
 
 분석 중인 상품: "${productName || '알 수 없는 상품'}"
 사용자 질문: "${question}"
-
+${ctxBlock}
 답변 규칙:
 - 핵심만 간결하게, 3~5문장 이내로 답변하세요.
 - 표(table)는 절대 사용하지 마세요.
 - 마크다운 헤더(#, ##)는 사용하지 마세요.
 - 불릿(•, -)은 꼭 필요할 때만 최대 3개까지만 사용하세요.
 - 반드시 ${langName}로 자연스럽게 대화하듯 답변하세요.
-- 모르는 정보는 모른다고 짧게 말하세요.`;
+- 모르는 정보는 모른다고 짧게 말하세요.${ctxRules}`;
 
   const controller = new AbortController();
   const tid = setTimeout(() => controller.abort(), 25000);
@@ -1079,30 +1172,114 @@ function notifyWishlistLow(t, price, prevMin) {
 }
 
 // ── 판매자 신뢰 경고 (HTML 기반, 워커에 DOM 없음) ───────────────
-// 다크패턴 감지 (HTML 텍스트 기반) — content-script와 동일 규칙
-function buildDarkPatternWarningsFromHtml(html) {
-  const text = String(html || '').replace(/<script[\s\S]*?<\/script>/gi, ' ').replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ');
-  const rules = [
-    { id: 'dp-urgency', re: /(남은\s*시간|마감\s*임박|판매\s*종료\s*임박|곧\s*(마감|종료|품절)|지금\s*안\s*사면|[0-9]{1,2}\s*분\s*[0-9]{2}\s*초)/, message: '거짓 긴급성(카운트다운·마감 임박)으로 조급함을 유도할 수 있어요. 서두르지 말고 차분히 확인하세요.' },
-    { id: 'dp-social', re: /([0-9][0-9,]*\s*명(이)?\s*(구매|구입|주문|보고\s*있|담았|참여|신청))/, message: '“N명 구매/보는 중” 같은 사회적 증거는 과장·조작될 수 있어요. 실제 리뷰 수와 비교하세요.' },
-    { id: 'dp-stock', re: /((품절|재고)\s*임박|단\s*[0-9]+\s*개?\s*남|마지막\s*[0-9]+\s*개|[0-9]+\s*개?\s*(밖에\s*)?남았)/, message: '재고 압박(“품절 임박/N개 남음”)은 인위적으로 만들어질 수 있어요. 조급하게 결정하지 마세요.' },
-    { id: 'dp-subscription', re: /(무료\s*체험|첫\s*달\s*무료)[\s\S]{0,50}(자동\s*(결제|연장|갱신)|정기\s*결제|매월|구독)|자동\s*결제\s*동의/, message: '숨은 자동결제·정기구독 조건이 있을 수 있어요. 결제 전 “자동 결제/정기결제” 항목을 확인하세요.' },
-  ];
+// 판매 집계 표시가 리뷰 수와 맞는지 본다. 리뷰 작성률은 통상 구매의 5~20% 이므로
+// 리뷰 1건당 구매 20건까지는 정상 범위로 본다. 그 범위면 플랫폼 공식 집계로 보고 경고하지 않는다.
+// content-script.js 에 같은 함수가 있지만 워커에는 DOM 이 없어 content-script 를 import 할 수 없다 —
+// 여기 따로 정의한다. 이름·시그니처는 양쪽이 같아야 한다 (테스트가 소스에서 잘라내 쓴다).
+const SALES_PER_REVIEW_MAX = 20;
+const assessSalesClaim = (evidence, reviewCount) => {
+  const m = String(evidence || '').replace(/,/g, '').match(/([0-9]+)\s*명/);
+  const n = m ? Number(m[1]) : null;
+  if (n == null) return { n: null, verdict: 'unknown' };
+  if (reviewCount == null || !(reviewCount >= 0)) return { n, verdict: 'unverifiable' };
+  if (reviewCount === 0) return { n, verdict: n > 50 ? 'suspicious' : 'unverifiable' };
+  return { n, verdict: n <= reviewCount * SALES_PER_REVIEW_MAX ? 'corroborated' : 'suspicious' };
+};
+
+// 규칙 본문은 content-script.js 의 DARK_PATTERN_RULES 와 동일하게 유지해야 한다. 한쪽만 고치면
+// 페이지에서는 잡히는데 URL 분석에서는 안 잡히는 불일치가 생긴다.
+// '실시간 활동 표시'(검증 불가, 조급함 유도)와 '판매 집계 표시'(리뷰 수와 교차검증 가능)는 별개 규칙이다 —
+// 쿠팡 "한 달간 8,000명 이상 구매했어요"(리뷰 11,394건) 같은 공식 집계를 압박형으로 오탐했던 베타 피드백 때문.
+const BG_DARK_PATTERN_RULES = [
+  { id: 'dp-urgency', re: /(남은\s*시간|마감\s*임박|판매\s*종료\s*임박|곧\s*(마감|종료|품절)|오늘\s*(자정|24시)?\s*마감|지금\s*안\s*사면|[0-9]{1,2}\s*분\s*[0-9]{2}\s*초)/,
+    fairType: '시간제한 알림 (압박형)', law: false,
+    message: '시간 압박 표시(카운트다운·마감 임박)가 있어요. 실제 마감인지는 알 수 없으니 서두르지 마세요.' },
+  { id: 'dp-social-live',
+    re: /(지금|현재|실시간)?\s*([0-9][0-9,]*)\s*명(이)?[^.\n]{0,12}?(보고\s*있|보는\s*중|담았|장바구니에\s*담|구매\s*중)/,
+    fairType: '다른 소비자의 활동 알림 (압박형)', law: false,
+    message: '“지금 N명이 보고 있어요” 같은 실시간 활동 표시가 있어요. 이 숫자는 검증할 수 없고, 조급함을 유도하는 데 쓰이기도 해요.' },
+  // "N명이 구매 중" 은 실시간 활동(dp-social-live)이라 여기서 빼야 두 규칙이 겹치지 않는다 — 겹치면 집계를 리뷰 수로 걸러도 경고가 남는다.
+  { id: 'dp-social-sales',
+    re: /([0-9][0-9,]*)\s*명(이)?\s*(이상\s*)?[^.\n]{0,12}?(구매(?!\s*중)|구입|주문|참여|신청)/,
+    fairType: '다른 소비자의 활동 알림 (압박형)', law: false,
+    message: '“N명 구매” 표시가 있어요. 리뷰 수와 비교해 과장인지 확인하세요.' },
+  { id: 'dp-stock', re: /((품절|재고)\s*임박|단\s*[0-9]+\s*개?\s*남|마지막\s*[0-9]+\s*개|[0-9]+\s*개?\s*(밖에\s*)?남았)/,
+    fairType: '낮은 재고 알림 (압박형)', law: false,
+    message: '재고 압박 표시(“품절 임박/N개 남음”)가 있어요. 인위적으로 만들 수 있는 표시이니 조급해하지 마세요.' },
+  { id: 'dp-subscription', re: /(무료\s*체험|첫\s*달\s*무료|무료\s*이용)[\s\S]{0,50}(자동\s*(결제|연장|갱신)|정기\s*결제|매월|구독)|자동\s*결제\s*동의/,
+    fairType: '숨은 갱신 (편취형)', law: false,
+    message: '무료 안내 근처에 자동결제·정기구독 조건이 있어요. 결제 전 “자동 결제/정기결제” 항목을 꼭 확인하세요.' },
+  { id: 'dp-confirmshaming', re: /(괜찮아요[,\s]*(손해|할인|혜택|비싸게)|아니요[,\s]*(비싸게|손해|정가로)|혜택을?\s*포기|할인\s*받지\s*않을|나중에\s*후회)/,
+    fairType: '감정적 언어 사용 (압박형)', law: false,
+    message: '거절 선택지에 죄책감을 심는 문구(확인 쉐이밍)예요. 문구가 아니라 필요 여부로 판단하세요.' },
+  { id: 'dp-roachmotel', re: /(해지|탈퇴|구독\s*취소)[^.\n]{0,14}?(고객센터|상담원|전화|유선|방문)[^.\n]{0,8}?(에서만|으로만|로만|만)\s*(가능|신청|접수)/,
+    fairType: '취소·탈퇴 방해 (방해형)', law: true,
+    message: '가입은 클릭 한 번인데 해지는 전화·상담만 허용하는 구조예요(취소 방해). 가입 전 해지 방법을 확인하세요.' },
+];
+
+// HTML → 공백 정규화된 본문 텍스트. 이미 평문(rawText)이 와도 그대로 통과한다.
+const htmlToText = (html) => String(html || '').replace(/<script[\s\S]*?<\/script>/gi, ' ').replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ');
+
+// 다크패턴 감지 (HTML 텍스트 기반). reviewCount 는 판매 집계 표시(dp-social-sales)를 교차검증하는 데 쓴다.
+// 사이드바가 읽는 level/type 과, content-script 판정과 같은 evidenceLevel/method/fairType/law/evidence 를 함께 담는다.
+function buildDarkPatternWarningsFromHtml(html, reviewCount) {
+  const text = htmlToText(html);
   const out = [];
-  for (const r of rules) { try { if (r.re.test(text)) out.push({ id: r.id, level: 'high', type: 'darkpattern', message: r.message }); } catch (_) {} }
+  for (const r of BG_DARK_PATTERN_RULES) {
+    let m = null;
+    try { m = text.match(r.re); } catch (_) { continue; }
+    if (!m) continue;
+    const evidence = m[0].trim().slice(0, 90);
+    const item = {
+      id: r.id, level: 'high', type: 'darkpattern', evidenceLevel: 1, method: 'rule-text',
+      fairType: r.fairType, law: r.law, evidence, message: r.message,
+    };
+    if (r.id === 'dp-social-sales') {
+      const a = assessSalesClaim(evidence, reviewCount);
+      if (a.verdict === 'corroborated') continue;   // 리뷰 수와 맞는 집계 — 플랫폼 공식 집계로 보고 경고하지 않는다
+      const nStr = a.n != null ? a.n.toLocaleString('ko-KR') + '명' : 'N명';
+      item.message = a.verdict === 'suspicious'
+        ? `“${nStr} 구매” 표시가 리뷰 ${Number(reviewCount).toLocaleString('ko-KR')}건에 비해 지나치게 커요. 과장된 집계일 수 있어요.`
+        : `“${nStr} 구매” 표시가 있어요. 리뷰 수를 찾지 못해 검증할 수 없었어요.`;
+      item.corroboration = { n: a.n, reviewCount: reviewCount ?? null, verdict: a.verdict };
+    }
+    out.push(item);
+  }
   return out;
+}
+
+// content-script.js 의 parseReviewCountText 와 본문이 같아야 한다 — 워커에는 DOM 이 없어 import 할 수 없다.
+// 리뷰 수 텍스트 파서 — 숫자가 키워드 앞("11,394 개 상품평", 쿠팡)이든 뒤("리뷰 1,024", "상품평(11,394)")든 읽는다.
+// 소수("4.5")는 평점이므로 리뷰 수로 쓰지 않는다. 판매 집계 교차검증의 기준값이라, 틀리면 공식 집계를 과장으로 오판한다.
+const parseReviewCountText = (raw) => {
+  const t = String(raw || '');
+  const NUM = '([0-9]{1,3}(?:,[0-9]{3})+|[0-9]{1,7})';
+  const before = t.match(new RegExp('(?<![0-9.,])' + NUM + '\\s*(?:개|건)?\\s*(?:상품평|구매평|리뷰|후기)'));
+  if (before) return Number(before[1].replace(/,/g, ''));
+  const after = t.match(new RegExp('(?:상품평|구매평|리뷰|후기|평가)\\s*[(\\[]?\\s*' + NUM + '(?![0-9.])'));
+  if (after) return Number(after[1].replace(/,/g, ''));
+  return null;
+};
+
+// 리뷰 수·평점 추출 — 판매자 경고와 Q&A 페이지 맥락 두 곳이 같은 규칙을 쓴다 (한쪽만 바꾸지 말 것)
+// 리뷰 수는 위 parseReviewCountText 에 맡긴다 — 예전 "키워드 뒤 숫자" 정규식은 쿠팡 "11,394 개 상품평"을 놓치고
+// "리뷰 4.5" 를 4건으로 읽어, 판매 집계 교차검증에서 공식 집계를 과장으로 오판했다.
+// 평점도 소수 뒤에 숫자·점이 이어지면(가격·버전 등) 버린다 — content-script 의 평점 정규식과 같은 형태.
+function extractReviewSignals(text) {
+  const t = String(text || '');
+  const reviewCount = parseReviewCountText(t);
+  let rating = null;
+  const rm = t.match(/(?:평점|별점|평균\s*별점)\D{0,4}([0-5](?:\.[0-9])?)(?![\d.])/);
+  if (rm) rating = Number(rm[1]);
+  return { reviewCount, rating };
 }
 
 function buildSellerWarningsFromHtml(html) {
   const text = String(html || '').replace(/<script[\s\S]*?<\/script>/gi, ' ').replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ');
-  const out = buildDarkPatternWarningsFromHtml(html);
   const lrw = text.match(/([0-9]{1,4})\s*건\s*이하의\s*평가/);
-  let reviewCount = null;
-  const rc = text.replace(/,/g, '').match(/(?:리뷰|구매평|상품평|평가|후기)\D{0,4}([0-9]{1,7})\s*(?:건|개)?/);
-  if (rc) reviewCount = Number(rc[1]);
-  let rating = null;
-  const rm = text.match(/(?:평점|별점)\D{0,4}([0-5](?:\.[0-9])?)/);
-  if (rm) rating = Number(rm[1]);
+  // 리뷰 수를 먼저 구하고 다크패턴을 부른다 — 판매 집계 표시를 리뷰 수로 교차검증해야 하므로
+  const { reviewCount, rating } = extractReviewSignals(text);
+  const out = buildDarkPatternWarningsFromHtml(html, reviewCount);
   if (lrw) {
     out.push({ id: 'sw-lowreview-text', level: 'high', type: 'seller', message: `이 판매자는 '${lrw[0].trim()}'를 받은 신규/소규모 판매자입니다. 구매 전 환불·교환 정책을 확인하세요.` });
   } else if (reviewCount != null && reviewCount <= 14) {
