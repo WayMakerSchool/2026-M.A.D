@@ -4,16 +4,23 @@
   "version": "1.9.0",
   "description": "마이데이터 기반 스마트 안심 쇼핑 비서",
   "permissions": [
-    "activeTab",
-    "tabs",
-    "scripting",
     "storage",
     "sidePanel",
     "alarms",
     "notifications"
   ],
   "host_permissions": [
-    "<all_urls>"
+    "*://*.coupang.com/*",
+    "*://*.11st.co.kr/*",
+    "*://*.shopping.naver.com/*",
+    "*://*.smartstore.naver.com/*",
+    "*://*.brand.naver.com/*",
+    "*://*.gmarket.co.kr/*",
+    "*://*.auction.co.kr/*",
+    "*://*.interpark.com/*",
+    "*://*.lotteon.com/*",
+    "*://*.ssg.com/*",
+    "*://*.tmon.co.kr/*"
   ],
   "icons": {
     "16": "icons/icon16.png",
@@ -45,14 +52,34 @@
         "icons/*"
       ],
       "matches": [
-        "<all_urls>"
+        "*://*.coupang.com/*",
+        "*://*.11st.co.kr/*",
+        "*://*.shopping.naver.com/*",
+        "*://*.smartstore.naver.com/*",
+        "*://*.brand.naver.com/*",
+        "*://*.gmarket.co.kr/*",
+        "*://*.auction.co.kr/*",
+        "*://*.interpark.com/*",
+        "*://*.lotteon.com/*",
+        "*://*.ssg.com/*",
+        "*://*.tmon.co.kr/*"
       ]
     }
   ],
   "content_scripts": [
     {
       "matches": [
-        "<all_urls>"
+        "*://*.coupang.com/*",
+        "*://*.11st.co.kr/*",
+        "*://*.shopping.naver.com/*",
+        "*://*.smartstore.naver.com/*",
+        "*://*.brand.naver.com/*",
+        "*://*.gmarket.co.kr/*",
+        "*://*.auction.co.kr/*",
+        "*://*.interpark.com/*",
+        "*://*.lotteon.com/*",
+        "*://*.ssg.com/*",
+        "*://*.tmon.co.kr/*"
       ],
       "js": [
         "content-script.js"

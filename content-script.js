@@ -1252,7 +1252,11 @@ function hideFloatingButton() {
 }
 
 // 쇼핑 사이트에서 자동으로 버튼 표시
-const SHOPPING_HOSTS = ['coupang.com', '11st.co.kr', 'shopping.naver.com',
+// ⚠️ manifest.json 의 host_permissions / content_scripts.matches,
+//    그리고 사이드바의 SM_isShopUrl 과 **같은 목록이어야 한다**.
+//    어긋나면 그 쇼핑몰에서 아무 경고도 없이 조용히 동작하지 않는다.
+const SHOPPING_HOSTS = ['coupang.com', '11st.co.kr',
+  'shopping.naver.com', 'smartstore.naver.com', 'brand.naver.com',
   'gmarket.co.kr', 'auction.co.kr', 'interpark.com', 'lotteon.com', 'ssg.com', 'tmon.co.kr'];
 if (SHOPPING_HOSTS.some(h => location.hostname.includes(h))) {
   showFloatingButton();

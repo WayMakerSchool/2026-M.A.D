@@ -47,16 +47,17 @@ chrome.action.onClicked.addListener(async (tab) => {
     }
   }
 
+  // 오버레이 — manifest 의 content_scripts 에 선언된 쇼핑몰에서만 content script 가 존재한다.
+  // 그 외 사이트에서는 수신자가 없어 조용히 무시된다(의도된 동작).
   chrome.tabs.sendMessage(tab.id, { type: 'toggleOverlay' }, () => void chrome.runtime.lastError);
 });
 
 
 // ── Gemini 호출 경로 ────────────────────────────────────────────
-// 🔒 키는 더 이상 클라이언트 번들에 두지 않는다. 두 경로 중 하나로 호출한다:
-//   1) 사용자가 설정에서 '본인 키' 입력 → 그 키로 Gemini 직접 호출
-//   2) (기본) Firebase 프록시(GEMINI_PROXY_URL)로 호출 → 키는 서버 시크릿에만 존재
-// 배포 후: `firebase deploy --only functions` 출력 URL을 아래 GEMINI_PROXY_URL에 붙여넣거나
-//          설정에서 chrome.storage.local 'geminiProxyUrl'로 주입하세요.
+// 🔒 API 키는 이 번들에 절대 두지 않는다. 확장은 사용자 PC에 파일째 설치되므로
+//    코드에 박은 키는 발급 즉시 공개된 키다. 서버가 키를 들고 대신 호출한다.
+// 우선순위: ShoMate 백엔드(server/main.py) → 사용자 본인 키(설정) → 프록시
+//   셋 다 없으면 에러. 코드에 박아둔 폴백 키는 존재하지 않는다.
 // FastAPI 백엔드 (서류 아키텍처: 확장 → FastAPI → AI). 기본 로컬 개발 서버.
 // 설정에서 chrome.storage.local 'backendUrl'로 덮어쓸 수 있고, 서버가 꺼져 있으면 자동 폴백.
 const DEFAULT_BACKEND_URL = 'http://localhost:8000';
