@@ -1,0 +1,45 @@
+# ShoMate Gemini 프록시 — Wrangler(CLI) 배포 설정
+#
+# 대시보드에 코드를 붙여넣는 대신 CLI 로 배포할 때 쓴다 (README 8절 (b)). 대시보드로만 배포하면 이 파일은 읽히지 않는다.
+# 이 폴더(proxy/)에서 실행한다 — main 경로는 이 파일 기준이다:
+#   npx wrangler login      # 브라우저에서 승인
+#   npx wrangler deploy
+#
+# 시크릿은 이 파일에 절대 넣지 않는다 (저장소에 올라가는 평문 파일이다). 사용자가 직접 입력한다:
+#   npx wrangler secret put GEMINI_API_KEY
+#   npx wrangler secret put SHOMATE_LICENSE_SECRET   # 선택 — 결제 서버와 같은 값
+# 시크릿은 배포와 따로 저장되므로 deploy 를 다시 해도 지워지지 않는다.
+
+name = "shomate-proxy"        # 기존 배포 이름과 같아야 같은 Worker·같은 주소(…workers.dev)를 덮어쓴다
+main = "worker.js"
+compatibility_date = "2026-09-01"   # 표준 Web API 만 쓰므로 특정 날짜의 동작에 기대지 않는다. 오늘(2026-10-08) 이전 값
+
+# 확장이 https://shomate-proxy.iseongjang74.workers.dev/gemini 를 상수로 부른다 — workers.dev 주소를 끄지 않게 명시
+workers_dev = true
+
+# 대시보드에서 넣은 평문 변수(ALLOWED_EXTENSION_IDS, MAX_PROMPT_CHARS)를 배포 때 지우지 않게.
+# 공식 문서(Wrangler configuration, Source of truth): 대시보드에서 바꾼 환경 변수는 다음 배포 때 Wrangler 가 덮어쓴다.
+keep_vars = true
+
+# ── 배치(Placement): 한국 근처에서 실행 ─────────────────────────────
+# 왜: 2026-10-08 실측에서 Worker 가 홍콩(HKG) 데이터센터에서 실행됐고, Gemini API 는 홍콩 IP 를
+#     "User location is not supported for the API use." (400 FAILED_PRECONDITION) 으로 거절했다.
+#     Cloudflare 는 기본적으로 요청이 닿은 데이터센터에서 실행하며 위치를 보장하지 않는다.
+# 문법 출처 (2026-10-08 확인):
+#   https://developers.cloudflare.com/workers/configuration/placement/
+#   https://developers.cloudflare.com/changelog/2026-01-22-explicit-placement-hints/
+#   region 값은 "<공급자>:<리전 ID>" — 예 "aws:us-east-1", "gcp:europe-west1", "azure:westeurope".
+#   지정한 클라우드 리전과 지연이 가장 짧은 Cloudflare 데이터센터에서 실행된다.
+# gcp:asia-northeast3 = GCP 서울 리전. (같은 뜻의 AWS 표기는 "aws:ap-northeast-2".)
+#   주의: gcp:asia-east2 는 홍콩, gcp:asia-east1 은 대만이다 — 쓰지 않는다.
+# mode = "smart" 와 region 은 함께 쓸 수 없다(문서: mutually exclusive). Smart 로 바꾸려면 region 줄을 지우고
+#   mode = "smart" 를 넣는다 — 다만 Smart 는 지연만 보고 고르므로 Google 접점이 있는 홍콩에 남을 수 있다(README 8절).
+[placement]
+region = "gcp:asia-northeast3"
+
+# ── 로그 보존 (Workers Logs) ───────────────────────────────────────
+# 왜: 실시간 tail 은 창을 열어 둔 동안만 보인다. 다음에 502 가 나면 지난 요청의 업스트림 원문을 대시보드
+#     shomate-proxy → Observability 에서 보려고 켠다 (무료 플랜 포함, 보존 기간은 요금제에 따라 다름).
+# 출처: https://developers.cloudflare.com/workers/observability/logs/workers-logs/
+[observability]
+enabled = true

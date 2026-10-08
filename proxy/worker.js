@@ -13,6 +13,15 @@
  *   Worker 의 업스트림 호출 구성(URL 등)이 고장난 것이다. 원본 소스가 로컬에 없어 고칠 수 없으니
  *   main.py 의 계약을 기준으로 처음부터 다시 썼다. 업스트림 URL 은 main.py 와 같은 형식이다.
  *
+ *   다시 쓴 뒤(2026-10-08)에도 /health 는 200 인데 POST /gemini 가 502 "AI 오류 (upstream 400)" 였다.
+ *   응답 cf-ray 의 데이터센터가 8번 모두 HKG(홍콩)였고, 같은 키·같은 요청을 한국에서 로컬 FastAPI 로 보내면 200 이었다.
+ *   Gemini API 는 홍콩 IP 를 지원하지 않는 지역으로 보고 400 FAILED_PRECONDITION
+ *   ("User location is not supported for the API use.") 을 낸다. Cloudflare 는 Worker 실행 위치를 보장하지 않으므로
+ *   한국 사용자의 요청도 홍콩에서 실행될 수 있다 — 코드가 아니라 배치(Placement) 문제다.
+ *   해결은 README 8절의 배치 설정(대시보드 Smart, 또는 proxy/wrangler.toml 의 region 힌트로 CLI 배포).
+ *   그때 응답만 봐서는 키 문제인지 지역 문제인지 알 수 없었으므로, 이제 최종 실패 응답에 Google 오류의
+ *   status·message(정리본)와 colo 를 함께 싣는다 (describeUpstreamError). /health 에도 colo 를 낸다.
+ *
  * 키
  *   GEMINI_API_KEY 는 Cloudflare 의 Secret(env.GEMINI_API_KEY)에만 둔다. 이 파일·확장 번들·URL 에는 없다.
  *   업스트림에는 쿼리스트링(?key=)이 아니라 x-goog-api-key 헤더로 보낸다 —
@@ -270,8 +279,89 @@ async function postUpstream(url, payload, apiKey) {
   }
 }
 
+// ── 업스트림 최종 실패를 응답용으로 정리 ──────────────────────────
+// 예전 응답은 'AI 오류 (upstream 400)' 뿐이라 키 문제인지 지역 문제인지 응답만 보고 구분할 수 없었다(머리 주석).
+// Google 오류 본문 { error: { code, message, status } } 에서 status 와 message 만 꺼내 싣는다.
+// 원문 본문 전체는 여전히 응답에 싣지 않는다 — details 같은 다른 필드에 무엇이 섞일지 이 코드가 통제할 수 없어서다.
+// 원문은 runPlan 의 console.log(대시보드 Logs / wrangler tail)에만 남는다.
+const DETAIL_MAX_CHARS = 160;                     // detail 상한 — 진단에는 충분하고 응답이 불어나지 않게
+const API_KEY_LIKE_RE = /AIza[0-9A-Za-z_-]{15,}/g; // Google API 키 모양. 메시지에 키가 실릴 일은 없지만 만일을 위해 가린다
+// Google 의 status 는 FAILED_PRECONDITION 같은 enum 이름이다. 다른 모양이면 믿지 않고 버린다
+// (error 문구에 그대로 들어가고 사이드바가 100자에서 자르므로 길이도 묶는다).
+const GOOGLE_STATUS_RE = /^[A-Z][A-Z0-9_]{0,39}$/;
+// colo 는 IATA 공항 코드(HKG, ICN …). Cloudflare 가 채우는 값이지만 사용자에게 보이는 문구에 들어가므로 모양을 확인한다.
+const COLO_RE = /^[A-Za-z0-9]{2,8}$/;
+
+// request.cf.colo — 공식 문서 표현으로 "요청이 닿은 데이터센터"의 코드다.
+// 배치(Placement)를 켜지 않았으면 Worker 도 그곳에서 실행되므로 지역 문제를 바로 짚을 수 있다.
+// 배치를 켜면 코드가 다른 데이터센터에서 돌 수 있어 이 값은 '받은 곳'일 수 있다 — 실제 실행 위치는
+// Cloudflare 가 응답에 붙이는 cf-placement 헤더로 본다(README 8절). 없거나 모양이 이상하면 null.
+function coloOf(request) {
+  const cf = request && request.cf;
+  const colo = cf ? cf.colo : undefined;
+  return typeof colo === 'string' && COLO_RE.test(colo) ? colo : null;
+}
+
+// Google message 를 응답에 실을 수 있게 정리한다: 키 모양 가리기 → 공백 정리 → 160자 이내로 자르기.
+// 가리기를 먼저 한다 — 먼저 자르면 경계에 걸린 키의 앞부분(15자 미만이라 정규식에 안 걸림)이 남을 수 있다.
+function cleanUpstreamMessage(message) {
+  let s = String(message).replace(API_KEY_LIKE_RE, '<KEY>').replace(/\s+/g, ' ').trim();
+  if (s.length > DETAIL_MAX_CHARS) {
+    let cut = DETAIL_MAX_CHARS - 1;   // 말줄임표 1자를 붙여도 160자를 넘지 않게
+    const c = s.charCodeAt(cut - 1);
+    if (c >= 0xd800 && c <= 0xdbff) cut--;   // 서로게이트 쌍 가운데서 자르면 깨진 글자가 남는다
+    s = s.slice(0, cut) + '…';
+  }
+  return s || null;
+}
+
+/**
+ * 업스트림 최종 실패(상태 status, 본문 text)를 502 응답 본문으로 만든다. 순수 함수 — 던지지 않는다.
+ * 반환: { error, upstreamStatus, reason, detail, colo }
+ *   error  : 짧은 한국어 문구. 앞부분은 기존과 같은 'AI 오류 (upstream N' — 확장이 이 문구를 그대로 보여 주고
+ *            사이드바가 100자에서 자르므로 원인은 짧게 덧붙인다.
+ *   reason : Google status 문자열(예: FAILED_PRECONDITION) 또는 null
+ *   detail : 정리된 Google message 또는 null
+ *   colo   : 요청이 닿은 데이터센터 코드 또는 null
+ */
+function describeUpstreamError(status, text, colo) {
+  let reason = null;
+  let message = '';
+  try {
+    const parsed = JSON.parse(typeof text === 'string' ? text : '');
+    const err = isPlainObject(parsed) && isPlainObject(parsed.error) ? parsed.error : null;
+    if (err) {
+      if (typeof err.status === 'string' && GOOGLE_STATUS_RE.test(err.status)) reason = err.status;
+      if (typeof err.message === 'string') message = err.message;
+    }
+  } catch (e) { /* JSON 아님(게이트웨이 HTML 등) — 원인 필드 없이 기존 문구로 */ }
+  const where = typeof colo === 'string' && COLO_RE.test(colo) ? colo : null;
+  const head = 'AI 오류 (upstream ' + status;
+  let error;
+  if (/location is not supported/i.test(message)) {
+    // Gemini 는 실행 위치의 IP 로 지역을 막는다(홍콩 등) — 키·요청이 아니라 배치 문제임을 바로 보이게
+    error = head + ': 지원하지 않는 지역 ' + (where || '?') + ')';
+  } else if (/API key not valid|API_KEY_INVALID/i.test(message)) {
+    error = head + ': API 키가 올바르지 않음)';
+  } else if (status === 404 && /not found/i.test(message)) {
+    error = head + ': 모델을 찾을 수 없음)';
+  } else if (reason) {
+    error = head + ': ' + reason + ')';
+  } else {
+    error = head + ')';   // 원인을 모르면 기존 문구 그대로
+  }
+  return {
+    error: error,
+    upstreamStatus: status,
+    reason: reason,
+    detail: message ? cleanUpstreamMessage(message) : null,
+    colo: where,
+  };
+}
+
 // 사다리를 실제로 돈다. 반환: { status, body } — 핸들러가 그대로 JSON 응답으로 만든다.
-async function runPlan(plan, prompt, apiKey) {
+// colo 는 최종 실패 응답에 싣기 위한 값일 뿐 호출 자체에는 쓰지 않는다.
+async function runPlan(plan, prompt, apiKey, colo) {
   let lastStatus = 0;
   let lastText = '';
   const dead = {};   // 404 난 모델은 다시 부르지 않는다 (키에서 모델 자체가 안 열림)
@@ -301,9 +391,10 @@ async function runPlan(plan, prompt, apiKey) {
     lastText = r.text || '';
     if (lastStatus === 404) dead[step.model] = true;
   }
-  // 업스트림 에러 본문은 응답에 싣지 않는다 (키·내부 정보가 섞일 여지 차단). 진단은 wrangler tail 로.
-  console.log('Gemini ' + lastStatus + ': ' + lastText.slice(0, 300));
-  return { status: 502, body: { error: 'AI 오류 (upstream ' + lastStatus + ')' } };
+  // 업스트림 원문 본문은 응답에 싣지 않는다 (키·내부 정보가 섞일 여지 차단) — 원문은 로그에만(Logs / wrangler tail).
+  // 응답에는 describeUpstreamError 가 고른 status·message(정리본)·colo 만 싣는다.
+  console.log('Gemini ' + lastStatus + (colo ? ' @' + colo : '') + ': ' + lastText.slice(0, 300));
+  return { status: 502, body: describeUpstreamError(lastStatus, lastText, colo) };
 }
 
 // ── HTTP 공통 ───────────────────────────────────────────────────
@@ -359,11 +450,13 @@ function getApiKey(env) {
 }
 
 // ── 라우트 ──────────────────────────────────────────────────────
-function handleHealth(env, cors) {
+function handleHealth(env, cors, colo) {
+  // colo: 요청이 닿은 데이터센터(coloOf 주석 참고). 지역 문제(홍콩 HKG 등)를 curl 한 번으로 보게 넣는다.
+  // 키에 관한 정보(유무 외의 길이·앞자리 등)는 어떤 경우에도 싣지 않는다.
   // 확장이 30초 캐시로 호출한다. 키가 없으면 503 → 확장은 다음 경로로 간다.
-  if (!getApiKey(env)) return jsonResponse(503, { ok: false, error: 'GEMINI_API_KEY 미설정' }, cors);
+  if (!getApiKey(env)) return jsonResponse(503, { ok: false, error: 'GEMINI_API_KEY 미설정', colo: colo }, cors);
   // defaultModel: 새 코드가 배포됐는지 구별하는 표식이기도 하다 (옛 배포본은 bindings 를 냈다)
-  return jsonResponse(200, { ok: true, model: BASE_MODEL, defaultModel: DEFAULT_MODEL }, cors);
+  return jsonResponse(200, { ok: true, model: BASE_MODEL, defaultModel: DEFAULT_MODEL, colo: colo }, cors);
 }
 
 async function handleGemini(request, env, cors) {
@@ -389,7 +482,7 @@ async function handleGemini(request, env, cors) {
   const tier = await verifyLicense(body.license, env.SHOMATE_LICENSE_SECRET, Date.now() / 1000);
   const model = resolveModel(body.model, tier);
   const plan = buildPlan(model, sanitizeGenerationConfig(body.generationConfig), sanitizeTools(body.tools));
-  const result = await runPlan(plan, body.prompt, apiKey);
+  const result = await runPlan(plan, body.prompt, apiKey, coloOf(request));
   return jsonResponse(result.status, result.body, cors);
 }
 
@@ -401,7 +494,7 @@ export default {
       if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
       const path = new URL(request.url).pathname;
       if (path === '/health') {
-        if (request.method === 'GET') return handleHealth(env, cors);
+        if (request.method === 'GET') return handleHealth(env, cors, coloOf(request));
         return jsonResponse(405, { error: '허용되지 않는 메서드입니다' }, cors, { 'Allow': 'GET, OPTIONS' });
       }
       if (path === '/gemini') {

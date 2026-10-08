@@ -43,7 +43,7 @@ const NAMES = [
   'BASE_MODEL', 'DEFAULT_MODEL', 'MODEL_TIERS', 'MAX_PROMPT_CHARS', 'MAX_OUTPUT_TOKENS_CAP',
   'UPSTREAM_TIMEOUT_MS', 'ALLOWED_GEN_CONFIG_KEYS', 'ALLOWED_TOOL_KEYS',
   'upstreamUrl', 'sanitizeGenerationConfig', 'sanitizeTools', 'resolveModel', 'verifyLicense',
-  'buildPlan', 'corsHeaders', '__default',
+  'buildPlan', 'corsHeaders', 'describeUpstreamError', 'coloOf', '__default',
 ];
 
 // ── 보고 ───────────────────────────────────────────────────────
@@ -308,6 +308,16 @@ const TOKEN_ENT = 'eyJ0aWVyIjoiZW50ZXJwcmlzZSIsIm9yZGVyIjoiVC1FTlQiLCJleHAiOjQxM
 const TOKEN_EXPIRED = 'eyJ0aWVyIjoicHJvIiwib3JkZXIiOiJULU9MRCIsImV4cCI6MTAwMDAwMDAwMH0.eG4OHoOyk0c85eoSNpXTJHmO1IaNLBmMeq2LC4nB3bE';
 const NOW = 1790000000;   // 2026-09 — 결정적인 시각
 
+// Google 오류 본문 (2026-10-08 홍콩 데이터센터에서 실제로 받은 400 과 같은 모양)
+const LOC_ERR = { error: { code: 400, message: 'User location is not supported for the API use.', status: 'FAILED_PRECONDITION' } };
+const KEY_ERR = { error: { code: 400, message: 'API key not valid. Please pass a valid API key.', status: 'INVALID_ARGUMENT',
+  details: [{ '@type': 'type.googleapis.com/google.rpc.ErrorInfo', reason: 'API_KEY_INVALID', domain: 'googleapis.com' }] } };
+const NF_ERR = { error: { code: 404, status: 'NOT_FOUND',
+  message: 'models/gemini-9-flash is not found for API version v1beta, or is not supported for generateContent.' } };
+// 키 모양 문자열은 실행 중에 이어 붙여 만든다 — 저장소에 'AIzaSy…' 39자 리터럴이 있으면 비밀 스캐너가 진짜 키로 오인한다.
+// 'AIzaSy' + 33자 = 실제 Google API 키와 같은 길이. 가짜 값이다.
+const FAKE_KEY = 'AIza' + 'Sy' + 'abcdefghijklmnopqrstuvwxyz0123456';
+
 // ══ 동기 검사 ═══════════════════════════════════════════════════
 if (W) {
   section('내보낸 이름');
@@ -414,6 +424,82 @@ if (W) {
     check('요청 모델이 BASE_MODEL 이면 1단계', W.buildPlan(W.BASE_MODEL, {}, []).length === 1);
   });
 
+  section('업스트림 실패 설명 — describeUpstreamError');
+  safe('describeUpstreamError', function () {
+    const d = W.describeUpstreamError(400, J(LOC_ERR), 'HKG');
+    check("location 메시지 + HKG → 'AI 오류 (upstream 400: 지원하지 않는 지역 HKG)'",
+      d.error === 'AI 오류 (upstream 400: 지원하지 않는 지역 HKG)', J(d));
+    check('location → reason FAILED_PRECONDITION, upstreamStatus 400, colo HKG',
+      d.reason === 'FAILED_PRECONDITION' && d.upstreamStatus === 400 && d.colo === 'HKG', J(d));
+    check('location → detail = Google message 그대로(짧아서 안 잘림)', d.detail === LOC_ERR.error.message, J(d.detail));
+    const dq = W.describeUpstreamError(400, J(LOC_ERR), null);
+    check("colo 모름 → '지원하지 않는 지역 ?', colo null", dq.error === 'AI 오류 (upstream 400: 지원하지 않는 지역 ?)' && dq.colo === null, J(dq));
+
+    const k = W.describeUpstreamError(400, J(KEY_ERR), 'ICN');
+    check("API key not valid → 'AI 오류 (upstream 400: API 키가 올바르지 않음)'", k.error === 'AI 오류 (upstream 400: API 키가 올바르지 않음)', J(k));
+    check('API key not valid → reason INVALID_ARGUMENT', k.reason === 'INVALID_ARGUMENT', J(k));
+    check('details 필드(ErrorInfo 등)는 결과에 없음', J(k).indexOf('googleapis.com') < 0 && J(k).indexOf('@type') < 0, J(k));
+
+    const n = W.describeUpstreamError(404, J(NF_ERR), 'ICN');
+    check("404 not found → 'AI 오류 (upstream 404: 모델을 찾을 수 없음)'", n.error === 'AI 오류 (upstream 404: 모델을 찾을 수 없음)', J(n));
+    const n400 = W.describeUpstreamError(400, J(NF_ERR), 'ICN');
+    check("'not found' 라도 400 이면 모델 문구 아님 (reason 으로)", n400.error === 'AI 오류 (upstream 400: NOT_FOUND)', J(n400));
+
+    const q = W.describeUpstreamError(429, J({ error: { code: 429, message: 'Quota exceeded', status: 'RESOURCE_EXHAUSTED' } }), 'ICN');
+    check("그 외 reason 있음 → 'AI 오류 (upstream 429: RESOURCE_EXHAUSTED)'", q.error === 'AI 오류 (upstream 429: RESOURCE_EXHAUSTED)', J(q));
+
+    const h = W.describeUpstreamError(500, '<html>Bad Gateway</html>', 'HKG');
+    check("JSON 아님 → reason null·detail null·기존 문구 'AI 오류 (upstream 500)'",
+      h.error === 'AI 오류 (upstream 500)' && h.reason === null && h.detail === null && h.upstreamStatus === 500, J(h));
+    const s = W.describeUpstreamError(400, J({ error: 'bad' }), null);
+    check("error 가 문자열인 JSON → reason null·detail null·'AI 오류 (upstream 400)'",
+      s.error === 'AI 오류 (upstream 400)' && s.reason === null && s.detail === null, J(s));
+    const e0 = W.describeUpstreamError(503, '', null);
+    check("빈 본문 → 'AI 오류 (upstream 503)'", e0.error === 'AI 오류 (upstream 503)' && e0.reason === null && e0.detail === null, J(e0));
+    check('본문이 문자열 아님(undefined) → 예외 없이 기존 문구', W.describeUpstreamError(400, undefined, null).error === 'AI 오류 (upstream 400)');
+
+    const m = W.describeUpstreamError(400, J({ error: { message: 'bad key ' + FAKE_KEY + ' here', status: 'INVALID_ARGUMENT' } }), null);
+    check("메시지 속 'AIzaSy'+33자 → '<KEY>' 로 가려짐", m.detail === 'bad key <KEY> here' && J(m).indexOf(FAKE_KEY) < 0 && J(m).indexOf('AIza') < 0, J(m));
+    // 가리기 → 자르기 순서 검사: 먼저 자르면 150자 뒤의 키 앞 9자('AIzaSyabc')가 정규식(15자 이상)에 안 걸려 남는다
+    const mb = W.describeUpstreamError(400, J({ error: { message: 'y'.repeat(150) + FAKE_KEY + 'z'.repeat(20) } }), null);
+    check('160자 경계에 걸친 키도 남지 않음 (가린 뒤에 자른다)', !!mb.detail && mb.detail.indexOf('AIza') < 0, J(mb.detail));
+
+    const longMsg = 'x'.repeat(500);
+    const L = W.describeUpstreamError(400, J({ error: { message: longMsg, status: 'INVALID_ARGUMENT' } }), null);
+    check('160자 초과 메시지 → 160자 이내로 잘림', typeof L.detail === 'string' && L.detail.length <= 160 && L.detail.length >= 150 &&
+      L.detail.indexOf('x'.repeat(150)) === 0, L.detail && L.detail.length);
+    check('잘린 결과에 원문 500자 전체는 없음', J(L).indexOf(longMsg) < 0);
+    const em = W.describeUpstreamError(400, J({ error: { message: 'x'.repeat(158) + '😀😀' } }), null);
+    check('서로게이트 쌍 가운데서 자르지 않음', !!em.detail && em.detail.length <= 160 && !/[\ud800-\udbff]…$/.test(em.detail), J(em.detail));
+
+    const bad = W.describeUpstreamError(400, J({ error: { message: 'm', status: 'evil <b>status</b>' } }), '<b>');
+    check('status 가 enum 모양이 아니면 reason null, colo 모양이 이상하면 null', bad.reason === null && bad.colo === null &&
+      bad.error === 'AI 오류 (upstream 400)', J(bad));
+    check('error 문구는 짧다 (사이드바 100자 자르기 안쪽)', [d, k, n, q, h].every(x => x.error.length <= 60), J([d, k, n, q, h].map(x => x.error.length)));
+  });
+
+  section('coloOf');
+  safe('coloOf', function () {
+    check("request.cf = { colo: 'ICN' } → 'ICN'", W.coloOf({ cf: { colo: 'ICN' } }) === 'ICN');
+    check('request.cf 없음 → null', W.coloOf({}) === null && W.coloOf(null) === null);
+    check('colo 가 문자열 아님·이상한 모양 → null', W.coloOf({ cf: { colo: 7 } }) === null && W.coloOf({ cf: { colo: 'HK G' } }) === null);
+  });
+
+  section('proxy/wrangler.toml 정적 검사');
+  safe('wrangler.toml', function () {
+    let toml = null;
+    try { toml = readFile('proxy/wrangler.toml'); } catch (e) { toml = null; }
+    check('proxy/wrangler.toml 이 있음', typeof toml === 'string' && toml.length > 0);
+    const t = String(toml || '');
+    const noComments = t.replace(/(^|\s)#.*$/gm, '$1');
+    check('name = "shomate-proxy", main = "worker.js"', /^name\s*=\s*"shomate-proxy"\s*$/m.test(noComments) && /^main\s*=\s*"worker\.js"\s*$/m.test(noComments));
+    check('[placement] 블록이 있고 region 은 "<공급자>:<리전>" 형식',
+      /^\[placement\]\s*$/m.test(noComments) && /^region\s*=\s*"(aws|gcp|azure):[a-z0-9-]+"\s*$/m.test(noComments));
+    check('[observability] enabled = true', /^\[observability\]\s*$/m.test(noComments) && /^enabled\s*=\s*true\s*$/m.test(noComments));
+    check('시크릿 값 없음 (AIza… 키 모양·GEMINI_API_KEY 대입·[vars] 의 키 없음)',
+      !/AIza[0-9A-Za-z_-]{10,}/.test(t) && !/^\s*(GEMINI_API_KEY|SHOMATE_LICENSE_SECRET)\s*=/m.test(noComments));
+  });
+
   section('테스트용 HMAC 목 자체 검증 (RFC 4231 / FIPS 180-2 벡터)');
   check("sha256('abc')", hex(sha256(ascii('abc'))) === 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad');
   check('HMAC-SHA256 RFC 4231 #2', hex(hmacSha256Js(ascii('Jefe'), ascii('what do ya want for nothing?'))) ===
@@ -429,6 +515,8 @@ async function call(Wi, method, path, opts) {
   if (opts.raw !== undefined) body = opts.raw;
   else if (opts.json !== undefined) { body = J(opts.json); headers['Content-Type'] = 'application/json'; }
   const req = new MockRequest('https://shomate-proxy.test.workers.dev' + path, { method: method, headers: headers, body: body });
+  // 실제 Workers 는 런타임이 request.cf(colo 등)를 채운다. 목에서는 opts.cf 로 넣고, 없으면 cf 자체가 없다.
+  if (opts.cf !== undefined) req.cf = opts.cf;
   const res = await Wi.__default.fetch(req, opts.env === undefined ? ENV : opts.env, { waitUntil: function () {} });
   const text = await res.text();
   let json = null;
@@ -489,6 +577,13 @@ scenario('검사 3 — GET /health', async function () {
   check('키가 공백뿐 → 503', c.status === 503);
   const d = await call(W, 'GET', '/health', { env: null });
   check('env 자체가 없음 → 503 (예외 아님)', d.status === 503);
+  // colo: 지금 어느 데이터센터가 요청을 받았는지 curl 한 번으로 보이게 (지역 문제 진단)
+  check('cf 없음 → colo 필드가 있고 null', !!a.json && Object.prototype.hasOwnProperty.call(a.json, 'colo') && a.json.colo === null, a.text);
+  const icn = await call(W, 'GET', '/health', { cf: { colo: 'ICN' } });
+  check("request.cf = { colo: 'ICN' } → colo 'ICN'", icn.status === 200 && !!icn.json && icn.json.colo === 'ICN', icn.text);
+  const hkg503 = await call(W, 'GET', '/health', { env: {}, cf: { colo: 'HKG' } });
+  check("키 없음(503)에도 colo 'HKG'", hkg503.status === 503 && !!hkg503.json && hkg503.json.colo === 'HKG', hkg503.text);
+  check('health 응답에 키 문자열 없음', [a, icn].every(x => x.text.indexOf(ENV.GEMINI_API_KEY) < 0));
   check('health 는 업스트림을 부르지 않음', calls.length === 0);
 });
 
@@ -587,14 +682,56 @@ scenario('완화 사다리: 계속 400 이면 네 단계를 모두 시도', asyn
   }
 });
 
-scenario('검사 9 — 업스트림 500: 본문을 응답에 싣지 않음', async function () {
-  upstream = () => ({ status: 500, body: '{"error":{"message":"UPSTREAM-INTERNAL-DETAIL"}}' });
+scenario('검사 9 — 업스트림 500: 원문 본문 전체를 응답에 싣지 않음', async function () {
+  // 이제 Google message 는 정리해서 detail 로 싣는다(원인 구분용). 그래도 원문 본문 '전체'는 싣지 않는다는 뜻은 유지한다:
+  // 원문 그대로도, JSON 문자열 안에 이스케이프되어 들어간 모양도 응답에 없어야 한다.
+  const RAW = '{"error":{"message":"UPSTREAM-INTERNAL-DETAIL"}}';
+  upstream = () => ({ status: 500, body: RAW });
   const r = await call(W, 'POST', '/gemini', { json: LADDER_REQ });
   check('502 "AI 오류 (upstream 500)"', r.status === 502 && r.json && r.json.error === 'AI 오류 (upstream 500)', r.text);
-  check('응답에 업스트림 본문 없음', r.text.indexOf('UPSTREAM-INTERNAL-DETAIL') < 0, r.text);
+  check('응답에 업스트림 원문 본문 전체 없음 (그대로·이스케이프 모두)',
+    r.text.indexOf(RAW) < 0 && r.text.indexOf(J(RAW).slice(1, -1)) < 0, r.text);
+  check('응답은 정해진 필드만 (error, upstreamStatus, reason, detail, colo)', !!r.json &&
+    J(Object.keys(r.json).sort()) === J(['colo', 'detail', 'error', 'reason', 'upstreamStatus']), r.text);
+  check('upstreamStatus 500, reason null (status 없음), detail = message', !!r.json && r.json.upstreamStatus === 500 &&
+    r.json.reason === null && r.json.detail === 'UPSTREAM-INTERNAL-DETAIL', r.text);
   check('호출 1회 (5xx 는 즉시 중단)', calls.length === 1);
   check('console.log 에는 남음 (wrangler tail 진단용)', logs.some(l => l.indexOf('UPSTREAM-INTERNAL-DETAIL') >= 0), J(logs));
   check('로그에 API 키 없음', !logs.some(l => l.indexOf(ENV.GEMINI_API_KEY) >= 0));
+});
+
+scenario('지원하지 않는 지역 — 모든 단계가 400 location 이면 원인을 응답에', async function () {
+  // 2026-10-08 실측: HKG 데이터센터에서 실행되면 Gemini 가 모든 모델·설정에 같은 400 을 낸다.
+  // details 의 표식은 status·message 밖의 필드가 응답에 새지 않는지 보려고 넣었다.
+  const body = { error: Object.assign({}, LOC_ERR.error, { details: [{ debug: 'LOC-PRIVATE-DETAILS-FIELD' }] }) };
+  const RAW = J(body);
+  upstream = () => ({ status: 400, body: RAW });
+  const r = await call(W, 'POST', '/gemini', { json: LADDER_REQ, cf: { colo: 'HKG' }, origin: ORIGIN_OK });
+  check('502', r.status === 502, r.status + ' ' + r.text);
+  check("body.error 가 'AI 오류 (upstream 400' 로 시작 (확장의 기존 파싱과 호환)", !!r.json && typeof r.json.error === 'string' &&
+    r.json.error.indexOf('AI 오류 (upstream 400') === 0, r.text);
+  check("body.error 에 '지원하지 않는 지역 HKG'", !!r.json && r.json.error.indexOf('지원하지 않는 지역 HKG') >= 0, r.text);
+  check("body.reason === 'FAILED_PRECONDITION', upstreamStatus 400, colo 'HKG'", !!r.json &&
+    r.json.reason === 'FAILED_PRECONDITION' && r.json.upstreamStatus === 400 && r.json.colo === 'HKG', r.text);
+  check('원문 JSON 문자열 전체는 응답에 없음 (그대로·이스케이프 모두)', r.text.indexOf(RAW) < 0 && r.text.indexOf(J(RAW).slice(1, -1)) < 0, r.text);
+  check('details 필드 값은 응답에 없음', r.text.indexOf('LOC-PRIVATE-DETAILS-FIELD') < 0, r.text);
+  check('400 이라 사다리 네 단계를 모두 시도', calls.length === 4, 'calls=' + calls.length);
+  check('오류 응답에도 ACAO 반사', r.headers.get('access-control-allow-origin') === ORIGIN_OK);
+  check('로그에는 원문과 colo 가 남음 (진단용)', logs.some(l => l.indexOf('LOC-PRIVATE-DETAILS-FIELD') >= 0 && l.indexOf('HKG') >= 0), J(logs));
+  check('로그·응답에 API 키 없음', !logs.some(l => l.indexOf(ENV.GEMINI_API_KEY) >= 0) && r.text.indexOf(ENV.GEMINI_API_KEY) < 0);
+
+  calls = [];
+  const q = await call(W, 'POST', '/gemini', { json: { prompt: 'x' } });
+  check("cf 없음 → colo null, '지원하지 않는 지역 ?'", q.status === 502 && !!q.json && q.json.colo === null &&
+    q.json.error === 'AI 오류 (upstream 400: 지원하지 않는 지역 ?)', q.text);
+});
+
+scenario('API 키 오류 — 원인이 응답에 보임', async function () {
+  upstream = () => ({ status: 400, body: KEY_ERR });
+  const r = await call(W, 'POST', '/gemini', { json: { prompt: 'x' }, cf: { colo: 'ICN' } });
+  check("502 'AI 오류 (upstream 400: API 키가 올바르지 않음)'", r.status === 502 && !!r.json &&
+    r.json.error === 'AI 오류 (upstream 400: API 키가 올바르지 않음)', r.text);
+  check('reason INVALID_ARGUMENT, colo ICN', !!r.json && r.json.reason === 'INVALID_ARGUMENT' && r.json.colo === 'ICN', r.text);
 });
 
 scenario('업스트림 타임아웃·네트워크 오류·형식 오류', async function () {
