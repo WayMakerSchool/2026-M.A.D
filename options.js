@@ -31,6 +31,11 @@
       const why = st.backendUrl ? `백엔드 서버(${st.backendUrl})에 연결할 수 없어 ` : '';
       return { kind: 'ok', text: `AI 호출 경로: ${why}본인 Gemini API 키로 직접 호출합니다.` + naver };
     }
+    if (st.path === 'proxy') {
+      // getAiStatus 는 백엔드 → 본인 키 → 프록시 순으로 path 를 정하므로, 여기 오면 보통 본인 키가 없다.
+      // 그래도 키가 저장된 채로 오면 실제 호출(geminiRaw)은 본인 키가 먼저라는 걸 밝혀 문구가 순서와 어긋나지 않게 한다.
+      return { kind: 'ok', text: 'AI 호출 경로: ShoMate 프록시(' + (st.proxyHost || 'Worker') + ').' + (st.hasUserKey ? ' 본인 키도 저장돼 있어 그 키가 먼저 쓰입니다.' : '') + naver };
+    }
     const why = st.backendUrl ? `백엔드 서버(${st.backendUrl})에 연결할 수 없고 ` : '백엔드 서버 URL이 없고 ';
     return { kind: 'warn', text: `AI를 사용할 수 없습니다: ${why}Gemini API 키도 없습니다. 위에서 키를 입력하거나 백엔드 URL을 지정하세요.` + naver };
   }

@@ -56,8 +56,10 @@ chrome.action.onClicked.addListener(async (tab) => {
 // ── Gemini 호출 경로 ────────────────────────────────────────────
 // 🔒 API 키는 이 번들에 절대 두지 않는다. 확장은 사용자 PC에 파일째 설치되므로
 //    코드에 박은 키는 발급 즉시 공개된 키다. 서버가 키를 들고 대신 호출한다.
-// 우선순위: ShoMate 백엔드(server/main.py) → 사용자 본인 키(설정) → 프록시
-//   셋 다 없으면 에러. 코드에 박아둔 폴백 키는 존재하지 않는다.
+// 실제 순서(geminiRaw): ① 로컬 ShoMate 백엔드(server/main.py, 헬스체크 온라인일 때만)
+//   → ② 사용자 본인 키(설정) → ③ Cloudflare Worker 프록시(GEMINI_PROXY_URL).
+//   ③은 기본값으로 늘 있으므로 로컬 서버가 꺼져 있고 본인 키가 없어도 호출할 곳이 남는다.
+//   코드에 박아둔 폴백 키는 존재하지 않는다.
 // FastAPI 백엔드 (서류 아키텍처: 확장 → FastAPI → AI). 기본 로컬 개발 서버.
 // 설정에서 chrome.storage.local 'backendUrl'로 덮어쓸 수 있고, 서버가 꺼져 있으면 자동 폴백.
 const DEFAULT_BACKEND_URL = 'http://localhost:8000';
@@ -89,15 +91,19 @@ async function isBackendOnline() {
   return _backendOnline;
 }
 
-const GEMINI_PROXY_URL = ''; // 예: 'https://geminiproxy-xxxxxxxxxx-uc.a.run.app'
+// Cloudflare Worker 배포본 (소스는 proxy/worker.js — 배포는 Cloudflare 대시보드에 붙여넣어 한다. server/main.py 와 같은
+// POST /gemini 계약: { prompt, generationConfig, model, tools? } → Gemini 원본 JSON). 키는 Worker 시크릿에만 있다.
+// 백엔드 URL 이 아니라 프록시 자리에 두는 이유: Worker 에는 /billing 이 없어서, 백엔드로 쓰면 결제가 깨진다.
+// (설정 저장소 'geminiProxyUrl' 로 덮어쓸 수 있다 — getProxyUrl)
+const GEMINI_PROXY_URL = 'https://shomate-proxy.iseongjang74.workers.dev/gemini';
 // 🔒 API 키는 이 번들에 절대 두지 않는다.
 //    확장은 사용자 PC에 파일째 설치되고, 이 저장소는 공개돼 있다.
 //    코드에 박은 키는 발급 즉시 공개된 키다.
 //    "서버에서 키를 내려받는" 방식도 안 된다 — 받는 순간 네트워크 탭에 그대로 찍힌다.
 //    반드시 서버가 키를 들고 대신 호출하는 '프록시' 구조여야 한다 (server/main.py).
 //
-// 호출 우선순위: ShoMate 백엔드 → 사용자 본인 키(설정에서 입력) → 프록시
-// 셋 다 없으면 에러. 코드에 박아둔 폴백 키는 존재하지 않는다.
+// 호출 우선순위: 로컬 ShoMate 백엔드 → 사용자 본인 키(설정에서 입력) → Worker 프록시
+// 코드에 박아둔 폴백 키는 존재하지 않는다.
 // ── 모델 선택 ─────────────────────────────────────────────────
 // sidebar/model-selector.js 가 chrome.storage.local.selectedModel 에 저장한다.
 // 허용목록은 서버(main.py MODEL_TIERS)와 동일. 목록 밖 값은 URL 에 넣지 않고 기본 모델로.
@@ -198,6 +204,8 @@ async function getProxyUrl() {
     return (geminiProxyUrl || '').trim() || GEMINI_PROXY_URL;
   } catch { return GEMINI_PROXY_URL; }
 }
+// 화면·오류 문구에는 프록시 전체 URL 대신 호스트명만 쓴다 (짧고, 어디로 가는지는 충분히 보인다).
+const hostOf = (u) => { try { return new URL(u).hostname; } catch (_) { return u; } };
 
 // 설정 페이지(options.html)가 "지금 어느 경로로 AI를 부르는지" 보여줄 때 쓴다.
 // 코드에 박아둔 폴백 키가 없어졌으므로, 사용자가 자기 상태를 직접 확인할 수 있어야 한다.
@@ -205,14 +213,16 @@ async function getAiStatus() {
   const backendUrl = await getBackendUrl();
   const backendOnline = backendUrl ? await isBackendOnline() : false;
   const hasUserKey = !!(await getUserApiKey());
-  const hasProxy = !!(await getProxyUrl());
+  const proxyUrl = await getProxyUrl();
+  const hasProxy = !!proxyUrl;
+  const proxyHost = proxyUrl ? hostOf(proxyUrl) : '';   // 설정 화면 안내용
   const naver = await getNaverCreds();
   const hasNaver = !!(naver.id && naver.secret);
   const path = backendUrl && backendOnline ? 'backend'
     : hasUserKey ? 'userKey'
     : hasProxy ? 'proxy'
     : 'none';
-  return { path, backendUrl, backendOnline, hasUserKey, hasProxy, hasNaver };
+  return { path, backendUrl, backendOnline, hasUserKey, hasProxy, proxyHost, hasNaver };
 }
 
 // 선택 언어 — AI가 이 언어로 응답하도록 프롬프트에 주입
@@ -224,8 +234,8 @@ async function getLangName() {
   } catch { return '한국어'; }
 }
 
-// 우선순위: FastAPI 백엔드(온라인 시) → 사용자 키 직접 → Firebase 프록시 → 개발용 폴백 키.
-// 모델은 네 경로 모두 사용자가 고른 selectedModel 을 쓴다(백엔드는 라이선스 티어로 재검증).
+// 우선순위: 로컬 FastAPI 백엔드(온라인 시) → 사용자 키 직접 → Cloudflare Worker 프록시. 폴백 키는 없다.
+// 모델은 세 경로 모두 사용자가 고른 selectedModel 을 쓴다(백엔드는 라이선스 티어로 재검증).
 // 항상 Gemini 원본 JSON을 반환. tools: 선택 — [{ google_search: {} }] (웹검색 그라운딩).
 async function geminiRaw(prompt, generationConfig, signal, tools) {
   const extra = tools ? { tools } : {};
@@ -261,13 +271,15 @@ async function geminiRaw(prompt, generationConfig, signal, tools) {
     console.warn('[ShoMate] 백엔드 호출 실패, 폴백:', e?.message || e);
   }
 
-  // fetch 가 TypeError('Failed to fetch') 로 끝나면 어느 경로·모델에서 막혔는지 알 길이 없어
-  // 화면에 "AI 분석 실패: Failed to fetch" 만 남는다. 경로·모델을 붙여 다시 던진다.
+  // fetch 가 TypeError('Failed to fetch') 로 끝나면 어느 경로에서 막혔는지 알 길이 없어
+  // 화면에 "AI 분석 실패: Failed to fetch" 만 남는다. 경로를 붙여 다시 던진다.
+  // 사이드바 채팅은 오류를 100자에서 자르므로 화면 문구는 100자 안으로, 모델·원인은 콘솔에 남긴다.
   // 그 외 에러(geminiDirect 의 'Gemini 404: ...', Abort 등)는 그대로 올린다.
   const isNetworkError = (e) => e instanceof TypeError && /Failed to fetch|NetworkError/.test(String(e?.message || ''));
-  const connectError = (route, e) => new Error(
-    'AI 서버에 연결하지 못했습니다 (경로: ' + route + ', 모델: ' + model + '). 네트워크·VPN·광고차단 확장을 확인하세요. 원인: ' + e.message
-  );
+  const connectError = (route, e) => {
+    console.warn(`[ShoMate] AI 연결 실패 (경로: ${route}, 모델: ${model}):`, e?.message || e);
+    return new Error(('AI 서버 연결 실패 (' + route + '). 네트워크·VPN·광고차단 확장을 확인하세요.').slice(0, 100));
+  };
   const userKey = await getUserApiKey();
   if (userKey) {
     try {
@@ -279,28 +291,37 @@ async function geminiRaw(prompt, generationConfig, signal, tools) {
   }
   const proxyUrl = await getProxyUrl();
   if (proxyUrl) {
-    let proxyHost = proxyUrl;
-    try { proxyHost = new URL(proxyUrl).hostname; } catch (_) {}
+    const proxyHost = hostOf(proxyUrl);
     try {
       const res = await fetch(proxyUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt, generationConfig, model, ...extra }),
+        // 백엔드 분기와 같이 라이선스를 보낸다 — 빠지면 Worker 가 유료 사용자도 무료 모델로 내린다.
+        body: JSON.stringify({ prompt, generationConfig, model, license: await getLicense(), ...extra }),
         signal,
       });
-      if (!res.ok) { const e = await res.text().catch(() => ''); throw new Error(`Proxy ${res.status}: ${e.slice(0, 200)}`); }
+      if (!res.ok) {
+        // Worker·server/main.py 는 실패 시 {"error": "..."} 를 돌려준다 → 그 문구가 원인을 가장 잘 말한다.
+        // JSON 이 아니면(게이트웨이 HTML 등) 본문 앞 80자. 사이드바가 100자에서 자르므로 전체를 100자로 맞춘다.
+        const body = await res.text().catch(() => '');
+        let msg = '';
+        try {
+          const err = JSON.parse(body)?.error;
+          if (err) msg = typeof err === 'string' ? err : (err.message || JSON.stringify(err));
+        } catch (_) {}
+        if (!msg) msg = body.replace(/\s+/g, ' ').trim().slice(0, 80) || res.statusText || '응답 본문 없음';
+        throw new Error(('AI 프록시 오류 (' + res.status + '): ' + msg).slice(0, 100));
+      }
       return tag(await res.json(), '프록시');
     } catch (e) {
       if (isNetworkError(e)) throw connectError('프록시 ' + proxyHost, e);
       throw e;
     }
   }
-  // 여기까지 왔다면 쓸 수 있는 경로가 하나도 없다.
+  // 여기까지 왔다면 쓸 수 있는 경로가 하나도 없다 (GEMINI_PROXY_URL 을 비운 빌드에서만 도달).
   // 코드에 키를 박아두는 폴백은 의도적으로 두지 않는다 (번들 = 공개 파일).
-  throw new Error(
-    'AI 호출 경로가 없습니다. ShoMate 백엔드가 꺼져 있고, 설정에 본인 API 키도 프록시 주소도 없습니다. ' +
-    '서버를 실행하거나(server/README.md) 확장 설정에서 본인 Gemini API 키를 입력하세요.'
-  );
+  // 사이드바 채팅이 오류를 100자에서 자르므로 90자 안으로 유지한다.
+  throw new Error('AI에 연결할 수 없습니다. 확장 설정에서 본인 Gemini API 키를 입력하거나 ShoMate 서버를 켜세요.');
 }
 
 // 결제 완료 시 서버가 발급한 서명 토큰. 위조해도 서버가 서명 검증에서 걸러낸다.
@@ -576,7 +597,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       .then(sendResponse)
       .catch(err => sendResponse({
         path: 'none', backendUrl: '', backendOnline: false,
-        hasUserKey: false, hasProxy: false, hasNaver: false,
+        hasUserKey: false, hasProxy: false, proxyHost: '', hasNaver: false,
         error: err?.message || String(err),
       }));
     return true;
