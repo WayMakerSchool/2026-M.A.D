@@ -1,6 +1,16 @@
 // 버전 마커 — 페이지 콘솔(F12)에서 새 버전 로드 여부 확인용
 console.log('[ShoMate] content-script v1.9.0 로드됨');
 
+// ── 쿠팡 검색 결과 수집기(collectSearchResults) 배경 ───────────────
+// 공식 검색 API 는 전부 못 쓴다(네이버 쇼핑 검색 API 2026-07-31 종료, 쿠팡은 공개 API 없음,
+// 11번가는 사업자 전용). 그래서 사용자가 사이드바에서 '후보 찾기'를 눌렀을 때만 background 가
+// 쿠팡 검색 결과 페이지를 백그라운드 탭으로 1회 열고, 그 탭에 주입된 이 스크립트가 화면에
+// 실제 렌더된 결과를 읽어 돌려준다 — 사용자가 검색창에 직접 입력했을 때와 같은 요청 1회이며,
+// 자동·주기 실행은 없다(메시지가 올 때만 돈다). 읽는 것: 검색 HTML 의 JSON-LD ItemList
+// (상품명·상세 URL·가격·평점·리뷰 수 — 실측)와 DOM 카드(로켓 배지·품절·광고 표시·원가·무료배송).
+// 둘을 productId 기준으로 합쳐 넘기고, 필터·점수·URL 검증·Top3 는 background 가 맡는다.
+// 없는 값은 null 로 둬서 상위가 '데이터 부족'으로 표시할 수 있게 하고, 숫자를 지어내지 않는다.
+
 const selectors = {
   title: ['.title_main', '.prod-buy-header__title', '.prod_title', '#productTitle', '.product_title', '.title', 'h1', 'h2', '.prod-name', '.prod-name__title'],
   // 구체적(플랫폼 전용) → 일반 순서. querySelector 첫 매칭을 사용하므로 순서가 중요
@@ -1849,11 +1859,295 @@ window.addEventListener('message', (e) => {
 document.addEventListener('mouseup', () => { if (_hostNoSelectPrev !== null) setHostNoSelect(false); }, true);
 window.addEventListener('blur', () => { if (_hostNoSelectPrev !== null) setHostNoSelect(false); });
 
+// ── 쿠팡 검색 결과 수집기 ───────────────────────────────────────
+// background 가 { type: 'collectSearchResults' } 를 보낼 때만 돈다(자동 실행 없음).
+// 배경·읽는 내용은 파일 머리 주석 참고. 아래 함수들은 DOM 에 기대지 않는 순수 함수
+// (parseCoupangSearchJsonLd·mergeCoupangSearchItems·csr* 헬퍼)와 DOM 을 읽는 함수
+// (collectCoupangSearchDom·collectCoupangSearchResults)로 나뉜다. 순수 함수는 테스트가
+// 소스에서 잘라 JXA(node 없음, URL 전역 없음)로 돌리므로 브라우저 전역에 기대지 않는다.
+
+const COUPANG_ORIGIN = 'https://www.coupang.com';
+const COUPANG_PRODUCT_ID_RE = /\/vp\/products\/(\d+)/;
+// 긴 라벨을 앞에 둔다 — '판매자로켓' 안의 '로켓'이 '로켓배송' 등으로 오인되지 않게
+const COUPANG_ROCKET_LABELS = ['판매자로켓', '로켓프레시', '로켓직구', '로켓배송'];
+
+// 숫자 문자열("33,900", "(2,785)", "33900원", 33900) → 정수. 못 읽으면 null — 값을 지어내지 않는다.
+const csrInt = (v) => {
+  if (v == null || v === '') return null;
+  if (typeof v === 'number') return Number.isFinite(v) ? Math.round(v) : null;
+  const m = String(v).replace(/,/g, '').match(/\d+(?:\.\d+)?/);
+  if (!m) return null;
+  const n = Number(m[0]);
+  return Number.isFinite(n) ? Math.round(n) : null;
+};
+
+// 평점("4.5", 4.5, "4.5점") → 숫자. 쿠팡 평점은 5점 만점이므로 0~5 밖이면 오독으로 보고 null.
+const csrNum = (v) => {
+  if (v == null || v === '') return null;
+  const m = String(v).match(/\d+(?:\.\d+)?/);
+  if (!m) return null;
+  const n = Number(m[0]);
+  return (Number.isFinite(n) && n >= 0 && n <= 5) ? n : null;
+};
+
+// 상대·프로토콜 상대 경로 → 절대 URL. 브라우저에선 URL 생성자를, 없는 환경(JXA 테스트)에선
+// 수동 결합을 쓴다. base 가 없으면 쿠팡 origin 기준.
+const csrAbsUrl = (u, base) => {
+  if (typeof u !== 'string') return null;
+  const s = u.trim();
+  if (!s) return null;
+  const b = (typeof base === 'string' && base) ? base : COUPANG_ORIGIN;
+  if (typeof URL === 'function') {
+    try { return new URL(s, b).href; } catch (_) { return null; }
+  }
+  if (/^https?:\/\//i.test(s)) return s;
+  if (s.startsWith('//')) return 'https:' + s;
+  const om = b.match(/^(https?:\/\/[^/]+)/i);
+  const origin = om ? om[1] : COUPANG_ORIGIN;
+  return origin + (s.startsWith('/') ? s : '/' + s);
+};
+
+const csrProductId = (url) => {
+  const m = COUPANG_PRODUCT_ID_RE.exec(String(url || ''));
+  return m ? m[1] : null;
+};
+
+const csrRocketLabel = (t) => {
+  const s = String(t || '');
+  for (const lab of COUPANG_ROCKET_LABELS) if (s.includes(lab)) return lab;
+  return null;
+};
+
+const csrTypeIs = (node, t) => {
+  const ty = node && node['@type'];
+  return ty === t || (Array.isArray(ty) && ty.includes(t));
+};
+
+// 계약 1 의 item 틀. 모르는 값은 null; soldOut·adBadge 는 "표시를 못 봤다" 는 뜻의 false.
+const csrBlankItem = () => ({
+  name: null, price: null, originalPrice: null, url: null, image: null,
+  rating: null, reviewCount: null, rocket: null, freeShipping: null, soldOut: false, adBadge: false,
+});
+
+// JSON-LD Product 한 개 → item. 이름도 URL 도 없으면 쓸모가 없으므로 null.
+const csrItemFromJsonLdProduct = (p) => {
+  if (!p || typeof p !== 'object' || Array.isArray(p)) return null;
+  const it = csrBlankItem();
+  it.name = (typeof p.name === 'string' && p.name.trim()) ? p.name.trim() : null;
+  it.url = csrAbsUrl(typeof p.url === 'string' ? p.url : null);
+  const img = Array.isArray(p.image) ? p.image[0] : p.image;
+  it.image = typeof img === 'string' ? (csrAbsUrl(img) || null)
+    : (img && typeof img.url === 'string' ? (csrAbsUrl(img.url) || null) : null);
+  const offers = Array.isArray(p.offers) ? p.offers[0] : p.offers;
+  if (offers && typeof offers === 'object') {
+    const raw = (offers.price != null && offers.price !== '') ? offers.price : offers.lowPrice;
+    it.price = csrInt(raw);
+    // availability 는 계약엔 없지만 페이지가 명시한 품절 표시라 그대로 반영한다
+    if (/OutOfStock|SoldOut|Discontinued/i.test(String(offers.availability || ''))) it.soldOut = true;
+  }
+  const ar = p.aggregateRating;
+  if (ar && typeof ar === 'object') {
+    it.rating = csrNum(ar.ratingValue);
+    it.reviewCount = csrInt(ar.reviewCount != null ? ar.reviewCount : ar.ratingCount);
+  }
+  if (!it.name && !it.url) return null;
+  return it;
+};
+
+// 순수 함수 — JSON-LD 텍스트 → items[]. 처리하는 모양:
+//  (a) {"@type":"ItemList","itemListElement":[{"@type":"ListItem","item":{Product}}]}
+//  (b) itemListElement 원소가 바로 Product
+//  (c) 최상위가 배열이거나 @graph 안에 ItemList
+// 파싱 실패·예상 밖 구조면 예외 없이 [] (또는 그때까지 모은 부분 결과).
+function parseCoupangSearchJsonLd(jsonText) {
+  let data;
+  try { data = JSON.parse(String(jsonText == null ? '' : jsonText)); } catch (_) { return []; }
+  const out = [];
+  try {
+    const nodes = [];
+    const visit = (d) => {
+      if (!d || typeof d !== 'object') return;
+      if (Array.isArray(d)) { d.forEach(visit); return; }
+      nodes.push(d);
+      if (Array.isArray(d['@graph'])) d['@graph'].forEach(visit);
+    };
+    visit(data);
+    for (const node of nodes) {
+      const raw = node.itemListElement;
+      const list = Array.isArray(raw) ? raw : (raw && typeof raw === 'object' ? [raw] : null);
+      if (list) {
+        for (const el of list) {
+          if (!el || typeof el !== 'object') continue;
+          // (a) ListItem.item 이 Product / (b) 원소 자체가 Product
+          const prod = (el.item && typeof el.item === 'object') ? el.item : el;
+          const it = csrItemFromJsonLdProduct(prod);
+          if (it) out.push(it);
+        }
+      } else if (csrTypeIs(node, 'Product')) {
+        // 목록 밖에 홀로 선 Product 도 버리지 않는다
+        const it = csrItemFromJsonLdProduct(node);
+        if (it) out.push(it);
+      }
+    }
+  } catch (_) { /* 부분 결과라도 돌려준다 */ }
+  return out;
+}
+
+// 쿠팡 검색 카드 셀렉터 후보군 — 배열 순서대로 첫 매칭을 쓴다. 앞쪽은 실측한 마크업
+// (li.search-product …), 뒤쪽은 CSS-module 식 클래스(ProductUnit_…·Price_…)로 바뀐 신형 마크업에
+// 대비한 부분 일치 폴백이다. 폴백은 실측 전이라, 안 맞으면 그 필드만 null 로 남긴다.
+const CSR_SEL = {
+  item:        ['li.search-product', 'li[class*="ProductUnit_productUnit"]', 'ul#productList > li', 'ul[class*="ProductList"] > li'],
+  link:        ['a.search-product-link', 'a[href*="/vp/products/"]'],
+  name:        ['.name', '[class*="ProductUnit_productName"]', '[class*="productName"]'],
+  price:       ['.price-value', '[class*="Price_priceValue"]', '[class*="priceValue"]'],
+  basePrice:   ['.base-price', '[class*="Price_basePrice"]', '[class*="basePrice"]', 'del'],
+  rating:      ['.rating', '[class*="ProductRating_star"]'],
+  ratingCount: ['.rating-total-count', '[class*="ProductRating_ratingCount"]', '[class*="ratingCount"]'],
+  image:       ['img.search-product-wrap-img', 'img[class*="ProductUnit_productImage"]', 'img[class*="productImage"]', 'img'],
+  rocket:      ['.badge.rocket', '[class*="ImageBadge"]', '[class*="badge"]'],
+  soldOut:     ['.out-of-stock', '[class*="ProductUnit_soldOut"]', '[class*="soldOut"]', '[class*="out-of-stock"]'],
+  ad:          ['.ad-badge', '[class*="ad-badge"]', '[class*="AdMark"]'],
+};
+
+const csrFirst = (root, sels) => {
+  for (const sel of sels) {
+    try { const el = root.querySelector(sel); if (el) return el; } catch (_) {}
+  }
+  return null;
+};
+
+// 로켓 배지 — 구형·신형 모두 <img alt="로켓배송"> 꼴이라 alt 를 먼저 보고, 없으면 배지 텍스트.
+// 카드 본문 텍스트는 보지 않는다(상품명에 '로켓'이 들어가도 배송 방식이 아니다).
+const csrRocketOf = (li) => {
+  const imgs = li.querySelectorAll('img[alt]');
+  for (const im of imgs) { const lab = csrRocketLabel(im.getAttribute('alt')); if (lab) return lab; }
+  for (const sel of CSR_SEL.rocket) {
+    try {
+      for (const el of li.querySelectorAll(sel)) { const lab = csrRocketLabel(el.textContent); if (lab) return lab; }
+    } catch (_) {}
+  }
+  return null;
+};
+
+// DOM 폴백 — 검색 카드(li)마다 계약 1 의 item 을 만든다. 로켓·품절·광고·원가는 JSON-LD 에
+// 없어서 여기서만 얻는다.
+function collectCoupangSearchDom() {
+  const out = [];
+  let lis = [];
+  for (const sel of CSR_SEL.item) {
+    try { lis = Array.from(document.querySelectorAll(sel)); } catch (_) { lis = []; }
+    if (lis.length) break;
+  }
+  const base = location.href;
+  for (const li of lis) {
+    try {
+      const it = csrBlankItem();
+      const a = csrFirst(li, CSR_SEL.link);
+      it.url = a ? csrAbsUrl(a.getAttribute('href'), base) : null;
+      const nameEl = csrFirst(li, CSR_SEL.name);
+      it.name = nameEl ? ((nameEl.textContent || '').replace(/\s+/g, ' ').trim() || null) : null;
+      const priceEl = csrFirst(li, CSR_SEL.price);
+      it.price = priceEl ? csrInt(priceEl.textContent) : null;
+      const baseEl = csrFirst(li, CSR_SEL.basePrice);
+      it.originalPrice = baseEl ? csrInt(baseEl.textContent) : null;
+      const ratingEl = csrFirst(li, CSR_SEL.rating);
+      if (ratingEl) {
+        it.rating = csrNum(ratingEl.textContent);
+        // 신형 마크업은 숫자 없이 별 채움 너비(%)만 있다 → 5점 환산 (ratingFromStarWidth 와 같은 방식)
+        if (it.rating == null) {
+          const w = String(ratingEl.getAttribute('style') || '').match(/width\s*:\s*(\d+(?:\.\d+)?)%/);
+          if (w) it.rating = Math.round(Number(w[1]) / 20 * 10) / 10;
+        }
+      }
+      const cntEl = csrFirst(li, CSR_SEL.ratingCount);
+      it.reviewCount = cntEl ? csrInt(cntEl.textContent) : null;
+      const imgEl = csrFirst(li, CSR_SEL.image);
+      // 지연 로딩이면 src 는 자리표시자이고 data-img-src 가 진짜 주소. 배지 이미지는 상품 이미지가 아니다.
+      if (imgEl && !csrRocketLabel(imgEl.getAttribute('alt'))) {
+        it.image = csrAbsUrl(imgEl.getAttribute('data-img-src') || imgEl.getAttribute('src') || imgEl.getAttribute('data-src'), base);
+      }
+      it.rocket = csrRocketOf(li);
+      it.soldOut = !!csrFirst(li, CSR_SEL.soldOut);
+      it.adBadge = !!csrFirst(li, CSR_SEL.ad) || /ad-badge/.test(String(li.getAttribute('class') || ''));
+      // '무료배송' 표시가 없다고 유료배송이라 단정할 수 없어(로켓 상품은 글자 없이 무료) 못 봤으면 null
+      it.freeShipping = (li.textContent || '').includes('무료배송') ? true : null;
+      if (!it.name && !it.url) continue;
+      out.push(it);
+    } catch (_) {}
+  }
+  return out;
+}
+
+// 순수 함수 — JSON-LD 와 DOM 을 productId(/vp/products/{id}) 기준으로 병합한다.
+// 같은 상품이면 평점·리뷰·가격은 JSON-LD 를, 로켓·품절·광고·무료배송·원가는 DOM 을 우선한다
+// (각 값이 믿을 만하게 있는 쪽). 한쪽에만 있으면 그대로. 같은 productId 가 두 번 나오면 먼저 본 것만.
+function mergeCoupangSearchItems(ldItems, domItems) {
+  const keyOf = (it) => csrProductId(it.url) || (it.url ? 'url:' + it.url : (it.name ? 'name:' + it.name : null));
+  const map = new Map();
+  for (const it of (ldItems || [])) {
+    const k = keyOf(it);
+    if (k && !map.has(k)) map.set(k, { ld: it, dom: null });
+  }
+  for (const it of (domItems || [])) {
+    const k = keyOf(it);
+    if (!k) continue;
+    const e = map.get(k);
+    if (e) { if (!e.dom) e.dom = it; } else map.set(k, { ld: null, dom: it });
+  }
+  const out = [];
+  for (const { ld, dom } of map.values()) {
+    if (!ld || !dom) { out.push(ld || dom); continue; }
+    out.push({
+      name: ld.name || dom.name || null,
+      price: ld.price != null ? ld.price : dom.price,
+      originalPrice: dom.originalPrice != null ? dom.originalPrice : ld.originalPrice,
+      url: ld.url || dom.url || null,
+      image: ld.image || dom.image || null,
+      rating: ld.rating != null ? ld.rating : dom.rating,
+      reviewCount: ld.reviewCount != null ? ld.reviewCount : dom.reviewCount,
+      rocket: dom.rocket || ld.rocket || null,
+      freeShipping: dom.freeShipping != null ? dom.freeShipping : ld.freeShipping,
+      soldOut: !!(dom.soldOut || ld.soldOut),
+      adBadge: !!(dom.adBadge || ld.adBadge),
+    });
+  }
+  return out;
+}
+
+// 쿠팡 검색 결과 페이지인가 — hostname 이 coupang.com(또는 그 하위)이고 경로가 /np/search 로 시작
+const isCoupangSearchPage = () => {
+  try {
+    const h = String(location.hostname || '');
+    return (h === 'coupang.com' || h.endsWith('.coupang.com')) && String(location.pathname || '').startsWith('/np/search');
+  } catch (_) { return false; }
+};
+
+// background 요청 1회 → 계약 1 응답. 모든 ld+json 을 파싱해 DOM 수집과 병합한다.
+function collectCoupangSearchResults() {
+  if (!isCoupangSearchPage()) return { ok: false, error: 'not-search-page' };
+  try {
+    const ld = [];
+    document.querySelectorAll('script[type="application/ld+json"]').forEach((s) => {
+      for (const it of parseCoupangSearchJsonLd(s.textContent || '')) ld.push(it);
+    });
+    const items = mergeCoupangSearchItems(ld, collectCoupangSearchDom());
+    return { ok: true, source: 'coupang', url: location.href, count: items.length, items };
+  } catch (e) {
+    return { ok: false, error: 'collect-failed: ' + ((e && e.message) || String(e)) };
+  }
+}
+
 // ── 메시지 리스너 ──────────────────────────────────────────────
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message && message.type === 'collectShoppingData') {
     sendResponse({ ok: true, data: collectShoppingData() });
+    return true;
+  }
+  // 쿠팡 검색 결과 수집 — background 가 백그라운드 탭을 열고 1회 요청할 때만 실행된다
+  if (message && message.type === 'collectSearchResults') {
+    sendResponse(collectCoupangSearchResults());
     return true;
   }
   if (message && message.type === 'toggleOverlay') {
