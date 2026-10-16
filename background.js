@@ -414,6 +414,14 @@ resumePendingUpgrade();
 const ITEM_PAID_ALARM = 'shomate-item-paid';
 const ITEM_PAID_TIMEOUT_MS = 15 * 60 * 1000;
 
+// 결제 기록에 남길 '아낀 돈'. 카테고리 순위 카드(meta.categoryRank)는 다른 상품이라 가격 차이를 절약으로 세지 않는다.
+// (사이드바도 0 을 보내야 하지만 여기서 한 번 더 막는다 — 이중 방어)
+function itemCheckoutSaved(meta) {
+  const m = meta || {};
+  if (m.categoryRank) return 0;
+  return Math.max(0, Math.round(Number(m.savings) || 0));
+}
+
 async function openItemCheckout(amount, name, meta = {}) {
   const amt = Math.round(Number(amount) || 0);
   if (!(amt > 0)) return { ok: false, error: '결제 금액이 없습니다.' };
@@ -438,7 +446,8 @@ async function openItemCheckout(amount, name, meta = {}) {
   await chrome.tabs.create({ url: `${base}/billing/checkout?${q}` });
   const pending = {
     sid, base, amount: amt, name: itemName,
-    saved: Math.max(0, Math.round(Number(meta.savings) || 0)),
+    saved: itemCheckoutSaved(meta),
+    categoryRank: !!(meta && meta.categoryRank),
     platform: String(meta.platform || '토스 결제').slice(0, 40),
     url: String(meta.url || '').slice(0, 500),
     startedAt: Date.now(),
@@ -510,7 +519,7 @@ async function recordPaidPurchase(pending, paid) {
   if (list.some(x => x.id === id || x.orderId === paid.orderId)) return;
   const record = {
     id, name: paid.name || pending.name, price,
-    date: purchaseDateLabel(capturedAt), saved: pending.saved || 0,
+    date: purchaseDateLabel(capturedAt), saved: pending.categoryRank ? 0 : (Number(pending.saved) || 0),
     platform: pending.platform || '토스 결제',
     source: 'toss', orderId: paid.orderId || '', url: pending.url || '',
     capturedAt,
@@ -580,6 +589,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.type === 'openCheckout') {
     openItemCheckout(message.amount, message.name, {
       savings: message.savings, platform: message.platform, url: message.url,
+      categoryRank: !!(message.categoryRank || (message.card && message.card.categoryRank)),
     })
       .then(sendResponse)
       .catch(err => sendResponse({ ok: false, error: err.message || String(err) }));
@@ -660,8 +670,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
   if (message.type === 'searchPrices') {
-    // 네이버 API 대신 쿠팡 검색 페이지 1회 수집(recommendForProduct). 현재가가 안 오면 geminiAnalyze 가 남긴
-    // lastAnalysisCtx 의 현재가를 쓴다 — savings 계산에 필요하고, 없으면 0 으로 "모름" 처리된다.
+    // 네이버 API 대신 쿠팡 검색 페이지 1회 수집. 현재가가 안 오면 geminiAnalyze 가 남긴
+    // lastAnalysisCtx 의 현재가를 쓴다 — 없으면 0 으로 "모름" 처리된다.
+    // mode:'category' 면 상품 종류 검색어로 검색한 결과에 3축 순위(rankCategoryForProduct), 아니면 같은 상품 최저가(recommendForProduct).
+    const isCategory = message.mode === 'category';
     (async () => {
       let currentPrice = Number(message.currentPrice) || 0;
       if (!currentPrice) {
@@ -670,13 +682,52 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           if (ctx && ctx.productName === message.query) currentPrice = Number(ctx.currentPrice) || 0;
         } catch (_) {}
       }
+      if (isCategory) {
+        return rankCategoryForProduct({
+          productName: message.query, currentPrice,
+          brand: message.brand, model: message.model, specText: message.specText,
+          weights: message.weights, priority: message.priority,
+          currentProductId: productIdFromUrl(message.sourceUrl),
+        });
+      }
       return recommendForProduct({
         productName: message.query, currentPrice,
         brand: message.brand, model: message.model, specText: message.specText,
       });
     })()
       .then(sendResponse)
-      .catch(err => sendResponse({ configured: false, error: err.message || String(err) }));
+      .catch(err => {
+        if (!isCategory) { sendResponse({ configured: false, error: err.message || String(err) }); return; }
+        console.warn('[ShoMate] 카테고리 순위 실패:', err?.message || err);
+        sendResponse({ configured: false, mode: 'category', error: CAT_ERR_GENERIC });
+      });
+    return true;
+  }
+  if (message.type === 'openRankedSearch') {
+    // 사용자 버튼으로만 — 쿠팡 검색 창을 보이는 탭으로 열고 그 탭을 순위 탭으로 기록한다
+    openRankedSearch(message)
+      .then(sendResponse)
+      .catch(err => {
+        console.warn('[ShoMate] 순위 탭 열기 실패:', err?.message || err);
+        sendResponse({ ok: false, error: '쿠팡 검색 탭을 열지 못했어요. 잠시 뒤 다시 눌러 주세요.' });
+      });
+    return true;
+  }
+  if (message.type === 'rankTabStatus') {
+    getRankTab(_sender?.tab?.id)
+      .then(e => sendResponse(e
+        ? { isRankTab: true, query: e.query || null, weights: e.weights || null, priority: e.priority || null, currentProductId: e.currentProductId || null }
+        : { isRankTab: false, query: null, weights: null, priority: null, currentProductId: null }))
+      .catch(() => sendResponse({ isRankTab: false, query: null, weights: null, priority: null, currentProductId: null }));
+    return true;
+  }
+  if (message.type === 'rankSearchItems') {
+    rankSearchItemsForTab(message, _sender)
+      .then(sendResponse)
+      .catch(err => {
+        console.warn('[ShoMate] 검색 페이지 순위 계산 실패:', err?.message || err);
+        sendResponse({ ok: false, error: '순위를 매기는 중 문제가 생겼어요. 페이지를 새로고침해 주세요.' });
+      });
     return true;
   }
   if (message.type === 'refreshWishlistPrices') {
@@ -1406,7 +1457,9 @@ const SYNONYMS = {
 const REC_MODEL_RE = /[A-Z]{1,5}-?\d{2,5}[A-Z]?/;   // 번들과 같은 의미의 모델 토큰 (예: WH-1000XM5 의 'XM5' 는 못 잡는다 — 한계)
 const REC_SEARCH_PAGE_RE = /\/search|query=|q=|keyword=|kwd=|category|\/np\/search|\/catalog\/|\/np\/categories|search\/all/i;
 
-let _recInFlight = null;   // 동시 1회만 — 진행 중이면 같은 Promise 를 돌려준다
+// URL 별 진행 중 수집. 같은 URL 이면 같은 Promise 를 돌려주고, 다른 URL(같은 상품 검색 vs 카테고리 검색)은 따로 연다.
+// (예전엔 전역 1개라 검색어가 다른 요청이 앞 요청의 결과를 그대로 받았다)
+const _recInFlight = new Map();
 
 const recEscapeRe = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const recClamp = (n, lo = 0, hi = 100) => Math.min(hi, Math.max(lo, Number(n) || 0));
@@ -1430,10 +1483,9 @@ function applySynonyms(text) {
 // 토큰 양끝의 장식 문자(★!~ 등) 제거
 const recStripDeco = (t) => t.replace(/^[\s!?~★☆♥♡■□▶◀●○◆◇※·,.:;'"`‘’“”#]+|[\s!?~★☆♥♡■□▶◀●○◆◇※·,.:;'"`‘’“”#]+$/g, '');
 
-// 1단계: 상품 페이지 제목 → 쿼리·핵심 토큰. 광고·수량·색상·옵션·판매처 문구를 벗겨 "무엇을 찾는지"만 남긴다.
-function buildSearchQuery(info) {
-  const src = info && typeof info === 'object' ? info : { productName: String(info || '') };
-  let s = String(src.productName || '');
+// 제목 정리(buildSearchQuery·buildCategoryQuery 공통): 괄호 블록·몰 꼬리·몰 이름·수량 패턴을 지우고 동의어를 맞춘다.
+function recCleanTitle(name) {
+  let s = String(name || '');
   // 괄호 블록([..] (..) 【..】 ｛..｝) — 대부분 광고·옵션 안내
   s = s.replace(/\[[^\]]*\]|\([^)]*\)|【[^】]*】|｛[^｝]*｝/g, ' ');
   // ' - 카테고리 | 몰' 과 ' | 몰' 꼬리 (쿠팡 제목: '상품명 - 휴대폰 | 쿠팡'). 카테고리 조각은 숫자 없는 짧은 것만 뗀다
@@ -1442,6 +1494,13 @@ function buildSearchQuery(info) {
   s = applySynonyms(s);
   for (const w of MALL_WORDS) s = s.replace(new RegExp(recEscapeRe(w), 'gi'), ' ');
   for (const re of NOISE_PATTERNS) s = s.replace(re, ' ');
+  return s;
+}
+
+// 1단계: 상품 페이지 제목 → 쿼리·핵심 토큰. 광고·수량·색상·옵션·판매처 문구를 벗겨 "무엇을 찾는지"만 남긴다.
+function buildSearchQuery(info) {
+  const src = info && typeof info === 'object' ? info : { productName: String(info || '') };
+  const s = recCleanTitle(src.productName);
 
   const brand = String(src.brand || '').trim() || null;
   let model = String(src.model || '').trim() || null;
@@ -1725,10 +1784,11 @@ function waitTabComplete(tabId, timeoutMs) {
 // 2단계 수집: 탭 열기 → 로드 대기 → collectSearchResults → 탭 닫기.
 // 사용자가 버튼을 눌러 검색한 것과 같은 1회 요청이다. 크롤링이 아니라 사용자 브라우저의 탭이고, 결과는 그 사용자에게만 보인다.
 // tabs.create/remove/onUpdated/sendMessage 는 별도 권한이 필요 없다(현재 permissions: storage,sidePanel,alarms,notifications 그대로).
-// 동시 1회만 — 버튼을 연타해도 탭은 하나만 열린다.
-async function collectViaBackgroundTab(url, timeoutMs = REC_TAB_TIMEOUT_MS) {
-  if (_recInFlight) return _recInFlight;
-  _recInFlight = (async () => {
+// 같은 URL 은 동시 1회만 — 연타해도 탭은 하나만 열린다. 다른 URL 요청은 자기 결과를 받는다.
+function collectViaBackgroundTab(url, timeoutMs = REC_TAB_TIMEOUT_MS) {   // async 아님 — 같은 URL 이면 진행 중인 Promise 자체를 돌려준다
+  const key = String(url || '');
+  if (_recInFlight.has(key)) return _recInFlight.get(key);
+  const job = (async () => {
     let tabId = null;
     try {
       const tab = await chrome.tabs.create({ url, active: false });
@@ -1741,6 +1801,7 @@ async function collectViaBackgroundTab(url, timeoutMs = REC_TAB_TIMEOUT_MS) {
           const res = await chrome.tabs.sendMessage(tabId, { type: 'collectSearchResults' });
           if (res && res.ok) return res;
           lastErr = new Error(res?.error || 'empty-response');
+          if (res && res.error === 'blocked') break;   // 쿠팡이 접근을 막은 페이지 — 다시 읽어도 같다
         } catch (e) {
           lastErr = e;   // "Could not establish connection" — content script 가 아직 안 떴다
         }
@@ -1749,10 +1810,13 @@ async function collectViaBackgroundTab(url, timeoutMs = REC_TAB_TIMEOUT_MS) {
       throw lastErr || new Error('collect-failed');
     } finally {
       if (tabId != null) { try { await chrome.tabs.remove(tabId); } catch (_) {} }
-      _recInFlight = null;
     }
   })();
-  return _recInFlight;
+  _recInFlight.set(key, job);
+  // 끝나면(성공·실패 모두) 이 URL 의 항목을 지운다. 동기 예외로 job 이 set 전에 끝나도 여기서 지워진다.
+  const clear = () => { if (_recInFlight.get(key) === job) _recInFlight.delete(key); };
+  job.then(clear, clear);
+  return job;
 }
 
 async function getRecWeights() {
@@ -1823,10 +1887,11 @@ async function recommendForProduct(info) {
   try {
     collected = await collectViaBackgroundTab(searchUrl, REC_TAB_TIMEOUT_MS);
   } catch (e) {
-    return { configured: false, error: '쿠팡 검색 결과를 읽지 못했습니다: ' + (e?.message || String(e)), query, queryVia };
+    console.warn('[ShoMate] 쿠팡 검색 수집 실패:', e?.message || e);
+    return { configured: false, error: catCollectErrorText(e, query), query, queryVia };
   }
   const raw = Array.isArray(collected?.items) ? collected.items : [];
-  if (!raw.length) return { configured: false, error: '쿠팡 검색 결과가 없습니다', query, queryVia };
+  if (!raw.length) return { configured: false, error: catEmptyResultText(query), query, queryVia };
 
   // 숫자 정리 — content script 가 준 값 그대로 믿지 않는다
   const cands = raw.map((it) => ({
@@ -1882,6 +1947,703 @@ async function recommendForProduct(info) {
   };
   await writeRecCache(query, result);
   return result;
+}
+
+// ── 카테고리 순위 (계약 3~5장) — 순수 함수 ─────────────────────
+// 같은 상품의 최저가 대신 "상품 종류" 검색어(예: '강아지 고양이 이동장')로 쿠팡을 검색하고, 그 결과에 나온
+// 다른 상품들에 ShoMate 3축(가격·품질·안정) 순위를 매긴다. 다른 상품과의 비교이므로 절약액(savings)·
+// 시장 최저가(lowest)는 만들지 않는다. 이 구간의 함수는 chrome.* 를 쓰지 않는다 —
+// tests/category-rank.test.js 가 이 구간(아래 '저장소·탭·오케스트레이터' 머리 주석 전까지)을 잘라 실행한다.
+const CATEGORY_WEIGHTS_DEFAULT = { price: 0.2, quality: 0.3, safety: 0.5 };   // 사이드바 기본 '안전성 우대'(p2) 와 같다
+const CATEGORY_PRIORITY_WEIGHTS = {                                           // 사이드바 p2() 와 같은 표
+  '가성비 우대': { price: 0.5, quality: 0.3, safety: 0.2 },
+  '배송속도 우대': { price: 0.34, quality: 0.33, safety: 0.33 },
+  '안전성 우대': { price: 0.2, quality: 0.3, safety: 0.5 },
+};
+const CATEGORY_PRIORITY_DEFAULT = '안전성 우대';
+const CATEGORY_TOP_N = 5;                 // 사이드바 카드 수
+const CATEGORY_QUERY_MAX = 20;            // 검색어 최대 글자 수
+const CATEGORY_QUERY_PICK = 3;            // 검색어 최대 토큰 수
+const CATEGORY_UNIT_RATIO = 0.6;          // 같은 규격 차원(g·ml·개)을 가진 후보 비율이 이 이상이면 단가로 비교
+const CATEGORY_OUTLIER_MIN_N = 8;         // 후보가 이 수 이상일 때만 가격 이상치(IQR)를 거른다
+const CATEGORY_ITEMS_MAX = 200;           // 한 번에 받는 수집 항목 상한 (쿠팡 한 페이지는 60개 안팎)
+const CATEGORY_ROCKETS = ['로켓배송', '로켓직구', '판매자로켓', '로켓프레시'];
+const CATEGORY_DIRECT_ROCKETS = ['로켓배송', '로켓직구', '로켓프레시'];   // 쿠팡 직매입 — 공식 반품 정책
+const CATEGORY_EXCLUDE_WHY = ['ad', 'soldOut', 'current', 'outlier', 'accessory', 'noSpec', 'badUrl'];
+// COLOR_WORDS 에 없는 색 이름 — 카테고리 검색어에 들어가면 엉뚱한 결과가 나온다
+const CATEGORY_COLOR_EXTRA = ['그래파이트', '크림', '라벤더', '코랄', '라이트그레이', '다크그레이', '스카이블루', '라이트블루',
+  '올리브', '버건디', '머스타드', '샴페인골드', '티타늄', '오프화이트', '혼합색상', '랜덤색상', '색상랜덤', '멀티컬러'];
+
+const catWon = (n) => String(Math.round(Number(n) || 0)).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+const catIsKoreanToken = (t) => typeof t === 'string' && t.length >= 2 && /[가-힣]/.test(t) && !/\d/.test(t);
+// 검색어 → 액세서리 판정·검색어 비교용 토큰 (공백 분리, 소문자)
+const categoryTokensOf = (query) => String(query || '').toLowerCase().split(/\s+/).map((t) => t.trim()).filter(Boolean);
+const categorySearchUrl = (query) => 'https://www.coupang.com/np/search?q=' + encodeURIComponent(String(query || ''));
+// 상품 상세 URL 에서 productId. 쿠팡 상세(/vp/products/{id}, 모바일 /vm/products/{id})만 인정한다
+function productIdFromUrl(url) {
+  const m = String(url || '').match(/^https?:\/\/(?:[a-z0-9-]+\.)*coupang\.com\/v[pm]\/products\/(\d{1,20})(?:[/?#]|$)/i);
+  return m ? m[1] : null;
+}
+// 보이는 탭으로 열어도 되는 주소: https://www.coupang.com/np/search?… 형태만
+function isCoupangSearchUrl(url) {
+  return /^https:\/\/www\.coupang\.com\/np\/search\?[^\s#]*(?:#[^\s]*)?$/.test(String(url || ''));
+}
+function queryFromSearchUrl(url) {
+  const m = String(url || '').match(/[?&]q=([^&#]*)/);
+  if (!m) return null;
+  try { return decodeURIComponent(m[1].replace(/\+/g, ' ')).replace(/\s+/g, ' ').trim() || null; } catch (_) { return null; }
+}
+function normalizeCategoryPriority(p) {
+  return Object.prototype.hasOwnProperty.call(CATEGORY_PRIORITY_WEIGHTS, p) ? p : CATEGORY_PRIORITY_DEFAULT;
+}
+// 가중치: 요청 weights(사이드바 p2) > priority 표 > 기본값. 합이 0 이하면 priority 표로 되돌린다. normalizeRecWeights 로 합 1.
+function resolveCategoryWeights(weights, priority) {
+  const base = CATEGORY_PRIORITY_WEIGHTS[priority] || CATEGORY_WEIGHTS_DEFAULT;
+  let merged = { ...base };
+  if (weights && typeof weights === 'object') {
+    for (const k of ['price', 'quality', 'safety']) { const v = Number(weights[k]); if (Number.isFinite(v) && v >= 0) merged[k] = v; }
+  }
+  if (!(merged.price + merged.quality + merged.safety > 0)) merged = { ...base };
+  return normalizeRecWeights(merged);
+}
+
+// 쿠팡 제목 꼬리 ' - 카테고리 | 쿠팡' 의 카테고리(숫자 없는 1~12자). 없으면 null. buildCategoryQuery 의 '2토큰 브랜드 의심' 경우에만 쓴다.
+function categoryTitleTail(productName) {
+  const s = String(productName || '').replace(/\[[^\]]*\]|\([^)]*\)|【[^】]*】|｛[^｝]*｝/g, ' ');
+  const m = s.match(/\s+-\s+([^|\-\d]{1,20})\s*\|\s*[^|]*$/);
+  if (!m) return null;
+  const t = m[1].replace(/\s+/g, ' ').trim();
+  if (!(t.length >= 1 && t.length <= 12) || /\d/.test(t)) return null;
+  // '우유/두유' 처럼 여러 분류가 붙어 오면 한글 분류 하나만 쓴다 — 제목에도 나오는 쪽을 우선. 'Apple' 같은 영문(브랜드)은 버린다.
+  const parts = t.split('/').map((x) => x.trim()).filter((x) => x && x.split(' ').every(catIsKoreanToken));
+  return parts.find((x) => s.includes(x)) || parts[0] || null;
+}
+
+// 카테고리 검색어(규칙 기반): 브랜드·모델·용량·색상·옵션·광고 문구를 빼고 "상품 종류" 한글 토큰만 남긴다.
+// 예) '호밍사이 강아지 백팩 고양이 이동장 … 고양이이동장' → '강아지 고양이 이동장'
+function buildCategoryQuery(info) {
+  const src = info && typeof info === 'object' ? info : { productName: String(info || '') };
+  const productName = String(src.productName || '');
+  const s = recCleanTitle(productName);
+  const noise = new Set(NOISE_WORDS.map((w) => w.toLowerCase()));
+  const colors = new Set([...COLOR_WORDS, ...CATEGORY_COLOR_EXTRA].map((w) => w.toLowerCase()));
+  const all = [];          // 제목의 한글 토큰 (중복 포함, 등장 순) — 빈도 계산용
+  let firstToken = null;   // 정리된 제목의 첫 토큰 (브랜드 추정용)
+  for (const raw of s.split(/\s+/)) {
+    let t = recStripDeco(raw);
+    if (!t) continue;
+    if (/[\/,]/.test(t) && !/^\d{1,3}(,\d{3})+/.test(t)) t = recStripDeco(t.split(/[\/,]/)[0]);
+    if (!t) continue;
+    if (firstToken == null) firstToken = t;
+    const low = t.toLowerCase();
+    if (noise.has(low)) continue;
+    if (colors.has(low) || colors.has(low.replace(/색$/, ''))) continue;
+    if (!catIsKoreanToken(t)) continue;   // 숫자 포함(용량·모델)·라틴 전용(영문 브랜드·모델)·1글자 제거
+    all.push(t);
+  }
+  const uniq = [];
+  for (const t of all) if (!uniq.some((u) => u.toLowerCase() === t.toLowerCase())) uniq.push(t);
+
+  // 브랜드 제거: brand 가 오면 그 토큰(과 그 이름으로 시작하는 토큰, 예: '삼성' → '삼성전자')을 뺀다.
+  // 없으면 첫 토큰이 한글이고 제목에 한 번만 나오며 한글 토큰이 3개 이상일 때 첫 토큰을 브랜드로 본다.
+  let cands = uniq;
+  const brand = String(src.brand || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  if (brand) {
+    const whole = brand.replace(/\s+/g, '');
+    const brandParts = brand.split(' ').filter((b) => b.length >= 2);
+    cands = uniq.filter((t) => {
+      const l = t.toLowerCase();
+      return !(l === whole || brandParts.includes(l) || (whole.length >= 2 && l.startsWith(whole)));
+    });
+  } else if (firstToken && uniq.length >= 3 && uniq[0] === firstToken
+             && s.split(firstToken).length - 1 === 1) {
+    cands = uniq.slice(1);
+  } else if (firstToken && uniq.length === 2 && uniq[0] === firstToken
+             && s.split(firstToken).length - 1 === 1) {
+    // 한글 토큰이 2개뿐이면 첫 토큰이 브랜드일 수 있다('햇반 백미밥'). 쿠팡 제목 꼬리 카테고리(' - 즉석밥 | 쿠팡')가
+    // 있을 때만 그 카테고리를 앞에 두고 첫 토큰을 뺀다 → '즉석밥 백미밥'. 꼬리가 없으면('비비고 왕교자') 그대로 둔다.
+    const tail = categoryTitleTail(productName);
+    if (tail) {
+      const parts2 = [tail];
+      if (uniq[1].toLowerCase() !== tail.toLowerCase()) parts2.push(uniq[1]);
+      while (parts2.length > 1 && parts2.join(' ').length > CATEGORY_QUERY_MAX) parts2.pop();
+      const q2 = parts2.join(' ');
+      return { query: q2, tokens: categoryTokensOf(q2), via: 'rule' };
+    }
+  }
+
+  // 빈도: 제목의 한글 토큰 중 t 를 부분 문자열로 품은 토큰 수 ('고양이' ← '고양이', '고양이이동장')
+  const scored = cands.map((t) => ({
+    t,
+    freq: all.filter((x) => x.toLowerCase().includes(t.toLowerCase())).length,
+    pos: uniq.indexOf(t),
+  }));
+  scored.sort((a, b) => b.freq - a.freq || a.pos - b.pos);
+  const parts = scored.slice(0, CATEGORY_QUERY_PICK).sort((a, b) => a.pos - b.pos).map((x) => x.t);
+  while (parts.length && parts.join(' ').length > CATEGORY_QUERY_MAX) parts.pop();
+  const query = parts.join(' ');
+  if (query) return { query, tokens: categoryTokensOf(query), via: 'rule' };
+  // 한글 종류 토큰이 하나도 없으면(영문 상품명 등) 같은 상품 검색어로 폴백
+  const fb = buildSearchQuery({ productName, brand: src.brand, model: src.model, specText: src.specText });
+  return { query: fb.query, tokens: fb.tokens, via: 'rule' };
+}
+
+// Gemini 가 준 카테고리 검색어 검증: 2~20자, 한글 포함, 1~4단어, 숫자 없음, 브랜드 미포함, 한글·영문·공백만.
+function validateCategoryQuery(q, brand) {
+  const s = String(q == null ? '' : q).replace(/\s+/g, ' ').trim();
+  if (s.length < 2 || s.length > CATEGORY_QUERY_MAX) return null;
+  if (!/[가-힣]/.test(s) || /\d/.test(s) || /[^가-힣a-zA-Z ]/.test(s)) return null;
+  const words = s.split(' ');
+  if (words.length < 1 || words.length > 4) return null;
+  const b = String(brand || '').replace(/\s+/g, '').toLowerCase();
+  if (b && s.replace(/\s+/g, '').toLowerCase().includes(b)) return null;
+  return s;
+}
+
+// 수집기 항목(계약 1장) 정리 — content script 가 준 값을 그대로 믿지 않는다. productId 가 없으면 버린다(배지를 붙일 곳이 없다).
+function normalizeCategoryItems(items) {
+  const out = [];
+  const idOf = (v) => (/^\d{1,20}$/.test(String(v == null ? '' : v)) ? String(v) : null);
+  const posInt = (v) => { const n = Number(v); return Number.isInteger(n) && n > 0 ? n : null; };
+  for (const it of (Array.isArray(items) ? items : []).slice(0, CATEGORY_ITEMS_MAX)) {
+    if (!it || typeof it !== 'object') continue;
+    const url = String(it.url || '');
+    const cleanUrl = it.cleanUrl ? String(it.cleanUrl) : null;
+    const productId = idOf(it.productId) || productIdFromUrl(url) || productIdFromUrl(cleanUrl);
+    if (!productId) continue;
+    const rating = Number(it.rating);
+    const dr = Number(it.discountRate);
+    out.push({
+      productId,
+      vendorItemId: idOf(it.vendorItemId),
+      itemId: idOf(it.itemId),
+      name: String(it.name || '').replace(/\s+/g, ' ').trim().slice(0, 200),
+      price: Number(it.price) > 0 ? Math.round(Number(it.price)) : 0,
+      originalPrice: Number(it.originalPrice) > 0 ? Math.round(Number(it.originalPrice)) : null,
+      discountRate: Number.isFinite(dr) && dr > 0 && dr < 100 ? Math.round(dr) : null,
+      rating: rating > 0 && rating <= 5 ? rating : null,
+      reviewCount: Number(it.reviewCount) > 0 ? Math.round(Number(it.reviewCount)) : null,
+      rocket: CATEGORY_ROCKETS.includes(it.rocket) ? it.rocket : null,
+      freeShipping: it.freeShipping === true ? true : (it.freeShipping === false ? false : null),
+      soldOut: !!it.soldOut,
+      adBadge: !!it.adBadge,
+      url, cleanUrl,
+      image: it.image ? String(it.image).slice(0, 1000) : null,
+      searchRank: posInt(it.searchRank),
+      coupangRank: posInt(it.coupangRank),
+    });
+  }
+  return out;
+}
+
+// 액세서리 단어가 상품명에 있는데 카테고리 토큰엔 없으면 본품이 아니다 (filterCandidates 와 같은 기준)
+function isCategoryAccessory(name, tokens) {
+  const n = String(name || '');
+  const toks = Array.isArray(tokens) ? tokens.map((t) => String(t).toLowerCase()) : [];
+  return ACCESSORY_WORDS.some((w) => n.includes(w) && !toks.some((t) => t.includes(w.toLowerCase())));
+}
+
+// 규격 차원: 'g' | 'ml' | 'count'(개수만) | null
+function categorySpecDim(sp) {
+  if (!sp) return null;
+  if (sp.totalG != null) return 'g';
+  if (sp.totalMl != null) return 'ml';
+  if (sp.count != null) return 'count';
+  return null;
+}
+
+// 4장 필터: 가격 없음(조용히) → productId 대표 → 광고·품절·현재 상품·액세서리·상세 URL → 단가 모드(noSpec) → 이상치.
+// 반환 kept 원소에는 effectivePrice·unitPriceLabel·link(정규화한 상세 URL)·specLabel 이 붙는다.
+function filterCategoryCandidates(items, opts) {
+  const o = opts || {};
+  const toks = (Array.isArray(o.tokens) ? o.tokens : []).map((t) => String(t).toLowerCase()).filter(Boolean);
+  const curId = o.currentProductId != null && String(o.currentProductId) ? String(o.currentProductId) : null;
+
+  // productId 별 대표: 광고 아닌 첫 원소. 그 상품이 광고로만 나왔으면 첫 광고 원소. (Map 은 처음 본 순서를 지킨다)
+  const groups = new Map();
+  for (const c of Array.isArray(items) ? items : []) {
+    if (!c || !c.name || !(Number(c.price) > 0)) continue;
+    const id = c.productId != null ? String(c.productId) : '';
+    if (!id) continue;
+    const g = groups.get(id);
+    if (!g || (g.adBadge && !c.adBadge)) groups.set(id, c);
+  }
+
+  const excluded = [];
+  let pass = [];
+  for (const [id, c] of groups) {
+    let why = null;
+    let link = null;
+    if (c.adBadge) why = 'ad';
+    else if (c.soldOut) why = 'soldOut';
+    else if (curId && id === curId) why = 'current';
+    else if (isCategoryAccessory(c.name, toks)) why = 'accessory';
+    else {
+      // 카드 링크는 개별 상세 페이지만 — 검색·카테고리 URL 은 어떤 경우에도 내보내지 않는다
+      let v = validateDetailUrl(c.url);
+      if (!v.ok && c.cleanUrl) v = validateDetailUrl(c.cleanUrl);
+      if (v.ok && productIdFromUrl(v.normalized) === id) link = v.normalized;
+      else why = 'badUrl';
+    }
+    if (why) excluded.push({ productId: id, why });
+    else pass.push({ ...c, productId: id, link });
+  }
+
+  // 단가 모드: 같은 차원의 규격을 가진 후보가 60% 이상이면 그 차원의 단가(100g·100ml·1개당)로 비교한다.
+  // 단, 개수 차원인데 전부 '1개'면(쿠팡 옵션 꼬리 ', 1개') 단가가 가격과 같아 의미가 없고 규격 없는 후보만 억울하게
+  // 빠지므로 단가 모드를 쓰지 않는다.
+  let unitMode = null;
+  const specs = pass.map((c) => parseSpec(c.name));
+  if (pass.length) {
+    const dims = specs.map(categorySpecDim);
+    for (const d of ['g', 'ml', 'count']) {
+      if (dims.filter((x) => x === d).length / pass.length >= CATEGORY_UNIT_RATIO) { unitMode = d; break; }
+    }
+    if (unitMode === 'count' && specs.every((sp) => categorySpecDim(sp) !== 'count' || sp.count === 1)) unitMode = null;
+  }
+  const next = [];
+  pass.forEach((c, i) => {
+    const sp = specs[i];
+    const specLabel = sp ? sp.label : null;
+    if (!unitMode) { next.push({ ...c, effectivePrice: c.price, unitPriceLabel: null, specLabel }); return; }
+    if (categorySpecDim(sp) !== unitMode) { excluded.push({ productId: c.productId, why: 'noSpec' }); return; }
+    let ep, label;
+    if (unitMode === 'g') { ep = (c.price / sp.totalG) * 100; label = `100g당 ${catWon(ep)}원`; }
+    else if (unitMode === 'ml') { ep = (c.price / sp.totalMl) * 100; label = `100ml당 ${catWon(ep)}원`; }
+    else { ep = c.price / sp.count; label = `1개당 ${catWon(ep)}원`; }
+    if (!(ep > 0) || !Number.isFinite(ep)) { excluded.push({ productId: c.productId, why: 'noSpec' }); return; }
+    next.push({ ...c, effectivePrice: ep, unitPriceLabel: label, specLabel });
+  });
+  pass = next;
+
+  // 가격 이상치: log(effectivePrice) 의 Q1−1.5·IQR 미만 / Q3+1.5·IQR 초과. IQR 이 0 이면(가격이 거의 같음) 거르지 않는다.
+  let kept = pass;
+  if (pass.length >= CATEGORY_OUTLIER_MIN_N) {
+    const logs = pass.map((c) => Math.log(c.effectivePrice)).sort((a, b) => a - b);
+    const quant = (p) => {
+      const pos = (logs.length - 1) * p;
+      const lo = Math.floor(pos), hi = Math.ceil(pos);
+      return logs[lo] + (logs[hi] - logs[lo]) * (pos - lo);
+    };
+    const q1 = quant(0.25), q3 = quant(0.75), iqr = q3 - q1;
+    if (iqr > 0) {
+      const lower = q1 - 1.5 * iqr, upper = q3 + 1.5 * iqr;
+      kept = pass.filter((c) => {
+        const l = Math.log(c.effectivePrice);
+        const out = l < lower || l > upper;
+        if (out) excluded.push({ productId: c.productId, why: 'outlier' });
+        return !out;
+      });
+    }
+  }
+  return { kept, excluded, unitMode };
+}
+
+function countCategoryExcluded(excluded) {
+  const counts = {};
+  for (const k of CATEGORY_EXCLUDE_WHY) counts[k] = 0;
+  for (const e of Array.isArray(excluded) ? excluded : []) if (e && counts[e.why] != null) counts[e.why]++;
+  return counts;
+}
+
+// 5장 점수: 세 축 0~100 정수, total = round(가중합). 입력은 건드리지 않고 복사본에 scores 등을 붙인다.
+function scoreCategoryCandidates(kept, weights) {
+  const w = resolveCategoryWeights(weights);
+  const list = (Array.isArray(kept) ? kept : []).map((c) => ({ ...c }));
+  const n = list.length;
+  if (!n) return list;
+  for (const c of list) {
+    c.price = Math.round(Number(c.price)) || 0;
+    const ep = Number(c.effectivePrice);
+    c.effectivePrice = ep > 0 && Number.isFinite(ep) ? ep : c.price;
+  }
+  // 가격: effectivePrice 오름차순 백분위. 동률은 평균 순위. 1개면 100.
+  const order = list.map((_, i) => i).sort((a, b) => list[a].effectivePrice - list[b].effectivePrice);
+  const avgRank = new Array(n);
+  for (let i = 0; i < n;) {
+    let j = i;
+    while (j + 1 < n && list[order[j + 1]].effectivePrice === list[order[i]].effectivePrice) j++;
+    for (let k = i; k <= j; k++) avgRank[order[k]] = (i + j) / 2;
+    i = j + 1;
+  }
+  // 품질 기준선 C: 평점·리뷰가 모두 있는 후보의 평균 평점
+  const rated = list.filter((c) => Number(c.rating) > 0 && Number(c.reviewCount) > 0);
+  const C = rated.length ? rated.reduce((a, c) => a + Number(c.rating), 0) / rated.length : 0;
+
+  list.forEach((c, idx) => {
+    const priceScore = n === 1 ? 100 : (100 * (n - 1 - avgRank[idx])) / (n - 1);
+    const R = Number(c.rating) || 0, v = Number(c.reviewCount) || 0;
+    const hasRating = R > 0 && v > 0;
+    let quality;
+    if (!hasRating) {
+      quality = 30;   // 모르는 건 모른다 — 중간값 50 을 주면 리뷰 없는 상품이 득을 본다
+    } else {
+      const adj = bayesianRating(R, v, C, BAYES_M);
+      quality = recClamp(recClamp(((adj - 1) / 4) * 100) + Math.min(10, 2.5 * Math.log10(1 + v)));
+    }
+    // 안정: 직매입 로켓 +25 / 판매자로켓 +12 / 무료배송 +5 / 평점 4.5↑·리뷰 100↑ +10 / 리뷰 1000↑ +5
+    //       리뷰 5개 미만(없음 포함) −10 / 할인율 70%↑ 또는 원가가 판매가의 3.3배↑ → 과장 할인 의심 −10
+    let safety = 50;
+    if (CATEGORY_DIRECT_ROCKETS.includes(c.rocket)) safety += 25;
+    else if (c.rocket === '판매자로켓') safety += 12;
+    if (c.freeShipping === true) safety += 5;
+    if (hasRating && v >= 100 && R >= 4.5) safety += 10;
+    if (v >= 1000) safety += 5;
+    if (v < 5) safety -= 10;
+    const op = Number(c.originalPrice) || 0;
+    const overDiscount = Number(c.discountRate) >= 70 || (op > 0 && c.price > 0 && op / c.price >= 3.3);
+    if (overDiscount) safety -= 10;
+
+    const ps = Math.round(recClamp(priceScore));
+    const qs = Math.round(recClamp(quality));
+    const ss = Math.round(recClamp(safety));
+    c.scores = { price: ps, quality: qs, safety: ss, total: Math.round(recClamp(w.price * ps + w.quality * qs + w.safety * ss)) };
+    c.dataInsufficient = !hasRating;
+    c.overDiscount = overDiscount;
+  });
+  return list;
+}
+
+// 순위: total ↓ → 리뷰 수 ↓ → effectivePrice ↑ (→ 검색 노출 순서 ↑). 1위는 평점·리뷰가 있는 첫 후보(가디언)로 끌어올린다.
+function rankCategoryCandidates(scored) {
+  const list = [...(Array.isArray(scored) ? scored : [])].sort((a, b) =>
+    (b.scores?.total ?? 0) - (a.scores?.total ?? 0)
+    || (Number(b.reviewCount) || 0) - (Number(a.reviewCount) || 0)
+    || (a.effectivePrice ?? 0) - (b.effectivePrice ?? 0)
+    || (a.searchRank ?? 1e9) - (b.searchRank ?? 1e9));
+  const first = list.find((c) => !c.dataInsufficient) || null;
+  const ordered = first ? [first, ...list.filter((c) => c !== first)] : list;
+  return {
+    ranked: ordered.map((c, i) => ({ ...c, rank: i + 1 })),
+    guardian: !!first,
+    guardianProductId: first ? first.productId : null,
+  };
+}
+
+// 카드 문구. currentPrice 를 모르거나 단가 모드(용량이 다른 상품끼리)면 현재 상품과의 가격 비교 구절은 넣지 않는다.
+function buildCategoryReason(c, ctx) {
+  const x = ctx || {};
+  const R = Number(c.rating) || 0, v = Number(c.reviewCount) || 0;
+  // 순위 숫자는 넣지 않는다 — 사이드바가 우선순위를 바꾸면 다시 정렬하므로 문장 속 'k위'가 화면 순서와 어긋난다.
+  const parts = [`「${x.query || ''}」 검색 결과 ${x.rankedCount || 0}개와 비교`];
+  parts.push(R > 0 && v > 0 ? `평점 ${R.toFixed(1)} (리뷰 ${catWon(v)}개)` : '평점·리뷰 데이터 부족');
+  if (c.rocket) parts.push(c.rocket);
+  else if (c.freeShipping === true) parts.push('무료배송');
+  if (c.unitPriceLabel) parts.push(c.unitPriceLabel);
+  const cur = Number(x.currentPrice) || 0;
+  if (cur > 0 && !x.unitMode) {
+    // 다른 상품(구성이 다를 수 있음)이라 '저렴·절약' 대신 중립적인 '가격 차이'로 쓴다. 후보가 싸면 −, 비싸면 +.
+    const diff = Math.round(Number(c.price) || 0) - Math.round(cur);
+    const sign = diff < 0 ? '\u2212' : diff > 0 ? '+' : '';
+    parts.push(`현재 상품과 가격 차이 ${sign}${catWon(Math.abs(diff))}원(다른 상품)`);
+  }
+  return parts.join(' · ');
+}
+function buildCategoryTags(c, query) {
+  const tags = [];
+  if (c.rocket) tags.push(c.rocket);
+  if (c.unitPriceLabel) tags.push(c.unitPriceLabel);
+  if (c.dataInsufficient) tags.push('평점·리뷰 부족');
+  tags.push(`쿠팡 「${query || ''}」 검색 기준`);
+  return tags.filter((t) => typeof t === 'string' && t.trim());
+}
+// 계약 2.1 card. savings 는 0(다른 상품이라 '아낀 돈'이 아니다), lowest 는 false.
+function buildCategoryCard(c, ctx) {
+  const x = ctx || {};
+  const price = Math.round(Number(c.price)) || 0;
+  const R = Number(c.rating) || 0, v = Number(c.reviewCount) || 0;
+  const hasRating = R > 0 && v > 0;
+  const s = c.scores || {};
+  return {
+    id: 'cp-' + c.productId,
+    type: 'optimal',
+    productName: c.name, name: c.name,
+    price, estimatedPrice: price,
+    savings: 0,
+    platform: '쿠팡',
+    tags: buildCategoryTags(c, x.query),
+    reason: buildCategoryReason(c, x),
+    rating: hasRating ? R : null,
+    reviewCount: hasRating ? v : null,
+    scores: { price: s.price | 0, quality: s.quality | 0, safety: s.safety | 0, total: s.total | 0 },
+    dataInsufficient: !!c.dataInsufficient,
+    lowest: false,
+    rank: c.rank,
+    candidateCount: x.rankedCount || 0,   // rank 의 분모(순위에 든 상품 수)
+    link: c.link,
+    image: c.image || null,
+    productId: c.productId,
+    categoryRank: true,
+  };
+}
+
+// 수집 항목 → 정리 → 필터 → 점수 → 순위 → 카드. 사이드바(searchPrices)와 검색 페이지 오버레이(rankSearchItems)가 같이 쓴다.
+// candidateCount = 가격이 있는 서로 다른 상품 수(제외 전), rankedCount = 순위에 든 상품 수.
+function rankCategoryItems(rawItems, opts) {
+  const o = opts || {};
+  const query = String(o.query || '');
+  const items = normalizeCategoryItems(rawItems);
+  const candidateCount = new Set(items.filter((c) => c.price > 0 && c.name).map((c) => c.productId)).size;
+  const tokens = Array.isArray(o.tokens) ? o.tokens : categoryTokensOf(query);
+  const { kept, excluded, unitMode } = filterCategoryCandidates(items, { tokens, currentProductId: o.currentProductId });
+  const weights = resolveCategoryWeights(o.weights, o.priority);
+  const { ranked, guardian, guardianProductId } = rankCategoryCandidates(scoreCategoryCandidates(kept, weights));
+  const rankedCount = ranked.length;
+  const ctx = { query, rankedCount, currentPrice: o.currentPrice, unitMode };
+  const cards = ranked.map((c) => buildCategoryCard(c, ctx));
+  return {
+    query, weights, candidateCount, rankedCount, unitMode, guardian, guardianProductId,
+    excluded, excludedCounts: countCategoryExcluded(excluded), ranked, cards,
+  };
+}
+
+// 사이드바 상태바 note — 없으면 null
+function buildCategoryNote(r) {
+  const notes = [];
+  if (r.rankedCount < CATEGORY_TOP_N) notes.push(`순위를 매길 수 있는 상품이 ${r.rankedCount}개뿐이에요`);
+  if (!r.guardian) notes.push('평점·리뷰 데이터가 없어 가디언 추천을 보류했어요');
+  if (r.unitMode) notes.push(`용량이 달라 ${r.unitMode === 'g' ? '100g' : r.unitMode === 'ml' ? '100ml' : '1개'}당 가격으로 비교했어요`);
+  return notes.length ? notes.join(' · ') : null;
+}
+
+// ── 카테고리 순위 — 저장소·탭·오케스트레이터 ───────────────────
+const CAT_QUERY_CACHE_MAX = 50;
+const CAT_GEMINI_TIMEOUT_MS = 6000;
+const RANK_TABS_MAX = 20;
+
+// 사용자에게 보이는 실패 문장(쉬운 한국어). 내부 코드(collect-failed·empty-response·blocked·연결 오류)는 console.warn 으로만 남긴다.
+const CAT_ERR_GENERIC = '쿠팡 검색 결과를 읽지 못했어요. 잠시 뒤 다시 분석해 주세요.';
+const catEmptyResultText = (query) => `쿠팡 「${query || ''}」 검색 결과에서 상품을 읽지 못했어요(결과가 없거나 쿠팡이 접근을 막았을 수 있어요).`;
+const catCollectErrorText = (e, query) => (String(e?.message || '') === 'blocked' ? catEmptyResultText(query) : CAT_ERR_GENERIC);
+
+const catQueryKey = (name) => String(name || '').replace(/\s+/g, ' ').trim().toLowerCase().slice(0, 200);
+
+// AI 카테고리 검색어. 6초 안에 검증을 통과한 답만 쓰고, 성공한 답은 상품명별로 캐시한다(최대 50). 실패·예외면 null.
+async function categoryQueryWithGemini(productName, brand) {
+  const key = catQueryKey(productName);
+  if (!key) return null;
+  try {
+    const { catQueryCache } = await chrome.storage.session.get('catQueryCache');
+    const hit = catQueryCache && catQueryCache[key];
+    const ok = hit && validateCategoryQuery(hit.query, brand);
+    if (ok) return ok;
+  } catch (_) {}
+  const ctrl = new AbortController();
+  let timer = null;
+  let q = null;
+  try {
+    const prompt = '다음 쇼핑 상품이 어떤 "상품 종류"인지 쿠팡 검색어로 답하라. 같은 종류의 다른 브랜드 상품들이 검색되어야 한다. '
+      + '브랜드·모델명·용량·수량·색상·옵션·광고 문구는 빼고 일반 명사 1~4단어, 20자 이내, 숫자 없이. JSON {"category":"..."} 만 출력\n\n'
+      + `상품명: ${String(productName).slice(0, 200)}` + (brand ? `\n브랜드(검색어에 넣지 말 것): ${String(brand).slice(0, 40)}` : '');
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => { try { ctrl.abort(); } catch (_) {} reject(new Error('timeout')); }, CAT_GEMINI_TIMEOUT_MS);
+    });
+    const data = await Promise.race([
+      geminiRaw(prompt, { temperature: 0, maxOutputTokens: 64, thinkingConfig: { thinkingBudget: 0 } }, ctrl.signal),
+      timeout,
+    ]);
+    const text = (data?.candidates?.[0]?.content?.parts || []).map((p) => p.text || '').join(' ').trim();
+    const m = text.match(/\{[\s\S]*\}/);
+    q = validateCategoryQuery(JSON.parse(m ? m[0] : text)?.category, brand);
+  } catch (e) {
+    console.warn('[ShoMate] 카테고리 검색어 AI 실패(규칙 기반 사용):', e?.message || e);
+    return null;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+  if (!q) return null;
+  try {
+    const { catQueryCache } = await chrome.storage.session.get('catQueryCache');
+    const now = Date.now();
+    const entries = Object.entries(catQueryCache || {}).filter(([k]) => k !== key);
+    entries.push([key, { query: q, savedAt: now }]);
+    entries.sort((a, b) => (b[1]?.savedAt || 0) - (a[1]?.savedAt || 0));
+    await chrome.storage.session.set({ catQueryCache: Object.fromEntries(entries.slice(0, CAT_QUERY_CACHE_MAX)) });
+  } catch (_) {}
+  return q;
+}
+
+// 6장 캐시: 수집 원본 items 만 (점수·카드는 가중치·현재가·현재 상품이 요청마다 달라 매번 다시 계산한다)
+async function readCatRecCache(query) {
+  try {
+    const { catRecCache } = await chrome.storage.session.get('catRecCache');
+    const hit = catRecCache && catRecCache['cat|' + query];
+    if (hit && Date.now() - (hit.savedAt || 0) < REC_CACHE_TTL_MS && Array.isArray(hit.items) && hit.items.length) return hit;
+  } catch (_) {}
+  return null;
+}
+async function writeCatRecCache(query, items, searchUrl) {
+  try {
+    const { catRecCache } = await chrome.storage.session.get('catRecCache');
+    const now = Date.now();
+    const key = 'cat|' + query;
+    const entries = Object.entries(catRecCache || {}).filter(([k, v]) => k !== key && v && now - (v.savedAt || 0) < REC_CACHE_TTL_MS);
+    entries.push([key, { savedAt: now, items, searchUrl }]);
+    entries.sort((a, b) => (b[1].savedAt || 0) - (a[1].savedAt || 0));
+    await chrome.storage.session.set({ catRecCache: Object.fromEntries(entries.slice(0, REC_CACHE_MAX)) });
+  } catch (_) {}
+}
+
+async function getLastCategoryRank() {
+  try {
+    const { lastCategoryRank } = await chrome.storage.session.get('lastCategoryRank');
+    return lastCategoryRank && typeof lastCategoryRank === 'object' ? lastCategoryRank : null;
+  } catch (_) { return null; }
+}
+
+// 보이는 순위 탭 기록 (storage.session.rankTabs[tabId]) — 탭이 닫히면 onRemoved 에서 지운다
+async function getRankTab(tabId) {
+  if (tabId == null) return null;
+  try {
+    const { rankTabs } = await chrome.storage.session.get('rankTabs');
+    const e = rankTabs && rankTabs[String(tabId)];
+    return e && typeof e === 'object' ? e : null;
+  } catch (_) { return null; }
+}
+// rankTabs 는 읽고-고치고-쓰기라, 버튼 연타·탭 닫힘이 겹치면 한쪽 항목이 사라진다. 모듈 수준 Promise 체인으로 한 번에 하나씩 쓴다.
+let _rankTabsLock = Promise.resolve();
+function withRankTabsLock(fn) {
+  const run = _rankTabsLock.then(fn, fn);
+  _rankTabsLock = run.catch(() => {});   // 앞 작업이 실패해도 다음 작업은 돈다
+  return run;
+}
+function setRankTab(tabId, entry) {
+  return withRankTabsLock(async () => {
+    const { rankTabs } = await chrome.storage.session.get('rankTabs');
+    const entries = Object.entries(rankTabs || {}).filter(([k]) => k !== String(tabId));
+    entries.push([String(tabId), entry]);
+    entries.sort((a, b) => (b[1]?.openedAt || 0) - (a[1]?.openedAt || 0));
+    await chrome.storage.session.set({ rankTabs: Object.fromEntries(entries.slice(0, RANK_TABS_MAX)) });
+  });
+}
+function deleteRankTab(tabId) {
+  return withRankTabsLock(async () => {
+    const { rankTabs } = await chrome.storage.session.get('rankTabs');
+    if (!rankTabs || !Object.prototype.hasOwnProperty.call(rankTabs, String(tabId))) return;
+    const next = { ...rankTabs };
+    delete next[String(tabId)];
+    await chrome.storage.session.set({ rankTabs: next });
+  });
+}
+chrome.tabs.onRemoved.addListener((tabId) => { deleteRankTab(tabId).catch(() => {}); });
+
+// 계약 2.1 오케스트레이터: AI → (실패 시) 규칙 검색어 → 캐시 → 비활성 탭 수집(닫기) → 필터 → 점수 → 상위 5 카드.
+// 자동 분석 경로라 보이는 탭은 절대 열지 않는다(순위 상품 클릭 → 자동 분석 → 탭 연쇄를 막는다).
+async function rankCategoryForProduct(info) {
+  const src = info && typeof info === 'object' ? info : {};
+  const productName = String(src.productName || '').trim();
+  const currentPrice = Number(src.currentPrice) || 0;
+  const priority = normalizeCategoryPriority(src.priority);
+  const weights = resolveCategoryWeights(src.weights, priority);
+  const currentProductId = src.currentProductId ? String(src.currentProductId) : null;
+  const brand = src.brand ? String(src.brand) : '';
+  if (productName.length < 2) return { configured: false, mode: 'category', error: '상품명이 없어 카테고리 검색어를 만들 수 없어요.' };
+
+  let query = null;
+  let queryVia = 'rule';
+  try {
+    const ai = await categoryQueryWithGemini(productName, brand);
+    if (ai) { query = ai; queryVia = 'gemini'; }
+  } catch (e) { console.warn('[ShoMate] 카테고리 검색어 AI 실패(규칙 기반 사용):', e?.message || e); }
+  if (!query) query = buildCategoryQuery({ productName, brand, model: src.model, specText: src.specText }).query;
+  if (!query) return { configured: false, mode: 'category', error: '카테고리 검색어를 만들지 못했어요.' };
+  const searchUrl = categorySearchUrl(query);
+
+  let items;
+  const hit = await readCatRecCache(query);
+  if (hit) {
+    items = hit.items;
+  } else {
+    let collected;
+    try {
+      collected = await collectViaBackgroundTab(searchUrl, REC_TAB_TIMEOUT_MS);
+    } catch (e) {
+      console.warn('[ShoMate] 카테고리 검색 수집 실패:', e?.message || e);
+      return { configured: false, mode: 'category', error: catCollectErrorText(e, query), query, searchUrl };
+    }
+    items = normalizeCategoryItems(collected?.items);
+    if (!items.length) {
+      console.warn('[ShoMate] 카테고리 검색 수집 결과 0개:', searchUrl);
+      return { configured: false, mode: 'category', error: catEmptyResultText(query), query, searchUrl };
+    }
+    await writeCatRecCache(query, items, searchUrl);
+  }
+
+  const r = rankCategoryItems(items, { query, tokens: categoryTokensOf(query), currentProductId, weights, currentPrice });
+  if (!r.rankedCount) {
+    const ec = r.excludedCounts;
+    const why = [['광고', ec.ad], ['품절', ec.soldOut], ['지금 보던 상품', ec.current], ['액세서리', ec.accessory],
+      ['규격 확인 불가', ec.noSpec], ['가격 이상치', ec.outlier], ['상세 주소 없음', ec.badUrl]]
+      .filter(([, n]) => n > 0).map(([k, n]) => `${k} ${n}`).join('·');
+    return {
+      configured: false, mode: 'category',
+      error: `쿠팡 「${query}」 검색 결과에서 순위를 매길 상품을 찾지 못했어요` + (why ? ` (제외: ${why})` : '') + '.',
+      query, searchUrl,
+    };
+  }
+  const top = r.cards.slice(0, CATEGORY_TOP_N).map((card, i) => ({
+    title: card.name, price: card.price, mall: '쿠팡', link: card.link, image: card.image,
+    specText: r.ranked[i].specLabel || null, card,
+  }));
+  const result = {
+    configured: true, mode: 'category', source: 'coupang-search',
+    query, queryVia, searchUrl,
+    candidateCount: r.candidateCount, rankedCount: r.rankedCount, excludedCounts: r.excludedCounts,
+    guardian: r.guardian, note: buildCategoryNote(r), weights: r.weights, priority, unitMode: r.unitMode,
+    lowest: null,
+    items: top,
+  };
+  try {
+    await chrome.storage.session.set({
+      lastCategoryRank: { query, searchUrl, weights: r.weights, priority, currentProductId, savedAt: Date.now() },
+    });
+  } catch (_) {}
+  return result;
+}
+
+// 계약 2.2: 사용자 버튼으로만 보이는 검색 탭을 연다. 빠진 값은 마지막 카테고리 순위(lastCategoryRank)로 채운다.
+async function openRankedSearch(msg) {
+  const m = msg || {};
+  const last = (await getLastCategoryRank()) || {};
+  const searchUrl = String(m.searchUrl || last.searchUrl || '');
+  if (!isCoupangSearchUrl(searchUrl)) return { ok: false, error: '쿠팡 검색 주소가 아니라서 열지 않았어요' };
+  const query = String(m.query || last.query || queryFromSearchUrl(searchUrl) || '').replace(/\s+/g, ' ').trim().slice(0, 60);
+  const priority = normalizeCategoryPriority(m.priority || last.priority);
+  const weights = resolveCategoryWeights(m.weights || last.weights, priority);
+  const currentProductId = productIdFromUrl(m.sourceUrl) || last.currentProductId || null;
+  const tab = await chrome.tabs.create({ url: searchUrl, active: true });
+  if (tab?.id == null) return { ok: false, error: '쿠팡 검색 탭을 열지 못했어요. 잠시 뒤 다시 눌러 주세요.' };
+  await setRankTab(tab.id, { query, weights, priority, currentProductId, openedAt: Date.now() });
+  return { ok: true, tabId: tab.id };
+}
+
+// 계약 2.4: 검색 페이지 content script 가 읽은 항목에 순위를 매긴다. 설정은 그 탭의 rankTabs → lastCategoryRank → 기본값.
+// 검색어는 페이지 주소의 q(사용자가 탭에서 검색어를 바꿨을 수 있다)를 먼저 쓴다.
+async function rankSearchItemsForTab(message, sender) {
+  const items = Array.isArray(message?.items) ? message.items : null;
+  if (!items) return { ok: false, error: '페이지에서 읽어 온 상품 목록이 없어요.' };
+  const conf = (await getRankTab(sender?.tab?.id)) || (await getLastCategoryRank()) || {};
+  const pageQuery = isCoupangSearchUrl(message.url) ? queryFromSearchUrl(message.url) : null;
+  const query = String(pageQuery || conf.query || '').replace(/\s+/g, ' ').trim().slice(0, 60);
+  const priority = normalizeCategoryPriority(conf.priority);
+  const weights = resolveCategoryWeights(conf.weights, priority);
+  const r = rankCategoryItems(items, {
+    query, tokens: categoryTokensOf(query), currentProductId: conf.currentProductId || null, weights,
+  });
+  return {
+    ok: true, query, weights: r.weights, priority,
+    candidateCount: r.candidateCount, rankedCount: r.rankedCount,
+    guardianProductId: r.guardianProductId, unitMode: r.unitMode,
+    ranked: r.ranked.map((c, i) => {
+      const card = r.cards[i];
+      return {
+        productId: c.productId, rank: c.rank, scores: card.scores, dataInsufficient: card.dataInsufficient,
+        link: card.link, name: card.name, price: card.price, unitPriceLabel: c.unitPriceLabel || null,
+        reason: card.reason, tags: card.tags,
+      };
+    }),
+    excluded: r.excluded,
+  };
 }
 
 // 네이버 쇼핑 검색 API 는 2026-07-31 종료. 호출부 없음. 삭제 예정 (옵션 UI 의 키 입력란은 이번에 손대지 않는다).

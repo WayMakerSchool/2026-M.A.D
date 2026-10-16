@@ -6,9 +6,11 @@ console.log('[ShoMate] content-script v1.9.0 로드됨');
 // 11번가는 사업자 전용). 그래서 사용자가 사이드바에서 '후보 찾기'를 눌렀을 때만 background 가
 // 쿠팡 검색 결과 페이지를 백그라운드 탭으로 1회 열고, 그 탭에 주입된 이 스크립트가 화면에
 // 실제 렌더된 결과를 읽어 돌려준다 — 사용자가 검색창에 직접 입력했을 때와 같은 요청 1회이며,
-// 자동·주기 실행은 없다(메시지가 올 때만 돈다). 읽는 것: 검색 HTML 의 JSON-LD ItemList
-// (상품명·상세 URL·가격·평점·리뷰 수 — 실측)와 DOM 카드(로켓 배지·품절·광고 표시·원가·무료배송).
-// 둘을 productId 기준으로 합쳐 넘기고, 필터·점수·URL 검증·Top3 는 background 가 맡는다.
+// 자동·주기 실행은 없다(메시지가 올 때만 돈다). 읽는 것: DOM 카드(가격·원가·할인율·평점·리뷰 수·
+// 로켓 배지·품절·광고 표시·무료배송·노출 순서)와 검색 HTML 의 JSON-LD ItemList(깔끔한 상세 URL 등).
+// DOM 카드 1개 = 원소 1개로 넘기고(productId 로 합치지 않는다) JSON-LD 는 빈 값을 채우는 데만 쓴다.
+// 필터·점수·URL 검증은 background 가 맡는다. 사용자가 사이드바 버튼으로 연 '순위 탭'에서는
+// 같은 수집 결과로 순위를 받아 카드 배지·패널을 그린다(파일 끝 오버레이 구간).
 // 없는 값은 null 로 둬서 상위가 '데이터 부족'으로 표시할 수 있게 하고, 숫자를 지어내지 않는다.
 
 const selectors = {
@@ -1477,6 +1479,8 @@ function renderDarkPatternAlert(items) {
 
 function runDarkPatternScan() {
   if (DP_WATCH.mutedUntilReload) return;
+  // 쿠팡 검색 결과 목록은 상품 수십 개의 문구가 한 페이지에 모여 오탐만 난다(페이지 로드 없이 검색으로 넘어온 경우 포함)
+  if (isCoupangSearchPage()) { dismissDarkPatternAlert(); return; }
   // 판매 집계("N명 구매") 교차검증용 리뷰 수. collectSellerSignals 는 DOM 을 몇 번 질의할 뿐이라
   // 900ms 디바운스 안에서 부담 없다. 실패해도 경고 자체는 내야 하므로 null 로 두고 진행한다.
   let reviewCount = null;
@@ -1512,7 +1516,9 @@ function setupDarkPatternWatcher() {
   });
   try { obs.observe(document.body, { subtree: true, childList: true, characterData: true }); } catch (_) {}
 }
-if (SHOPPING_HOSTS.some(h => location.hostname.includes(h))) {
+// 쿠팡 검색 페이지(/np/search)에서는 돌리지 않는다 — 목록 전체 텍스트로 판정하면 오탐이 난다.
+// isCoupangSearchPage 는 파일 아래쪽의 함수 선언(호이스팅됨)이다.
+if (SHOPPING_HOSTS.some(h => location.hostname.includes(h)) && !isCoupangSearchPage()) {
   setupDarkPatternWatcher();
 }
 
@@ -1860,15 +1866,27 @@ document.addEventListener('mouseup', () => { if (_hostNoSelectPrev !== null) set
 window.addEventListener('blur', () => { if (_hostNoSelectPrev !== null) setHostNoSelect(false); });
 
 // ── 쿠팡 검색 결과 수집기 ───────────────────────────────────────
-// background 가 { type: 'collectSearchResults' } 를 보낼 때만 돈다(자동 실행 없음).
+// background 가 { type: 'collectSearchResults' } 를 보낼 때, 그리고 순위 탭(아래 오버레이)에서만 돈다.
 // 배경·읽는 내용은 파일 머리 주석 참고. 아래 함수들은 DOM 에 기대지 않는 순수 함수
-// (parseCoupangSearchJsonLd·mergeCoupangSearchItems·csr* 헬퍼)와 DOM 을 읽는 함수
-// (collectCoupangSearchDom·collectCoupangSearchResults)로 나뉜다. 순수 함수는 테스트가
-// 소스에서 잘라 JXA(node 없음, URL 전역 없음)로 돌리므로 브라우저 전역에 기대지 않는다.
+// ('수집기 순수 함수' 구간: JSON-LD 파서·텍스트 파서·badge-id 매핑·href 파서·JSON-LD 보강)와
+// DOM 을 읽는 함수('수집기 DOM 함수' 구간)로 나뉜다. 순수 구간은 tests/search-collector.test.js 가
+// 구간 표시 주석으로 잘라 JXA(node 없음, URL 전역 없음)로 돌리므로 브라우저 전역에 기대지 않는다.
+//
+// 실측(2026-10-16, Next.js 신형 마크업) 요지:
+//  - 카드 #product-list > li[class*="ProductUnit_productUnit"][data-id=vendorItemId] (li.limited-time-offer 캐러셀 제외)
+//  - 링크 li > a[href*="/vp/products/"] (상대경로, itemId·vendorItemId·sourceType·rank 파라미터)
+//  - 가격 [class*="PriceArea_priceArea"]: 판매가 = del 밖의 'N원' 첫 말단 / 원가 = del / 할인율 'N%' 말단
+//  - 평점 [class*="ProductRating_productRating"] [aria-label] / 리뷰 수 '(1,843)' span
+//  - 로켓 img[data-badge-id] (alt 가 빈 문자열이라 alt 로는 못 가린다)
+//  - 광고 href sourceType=srp_product_ads · button[aria-label="Ad information"] · 정확히 '광고' 인 span
+//  - JSON-LD 는 CollectionPage.mainEntity(ItemList).itemListElement[].item(Product)
+// 구형 셀렉터(li.search-product 등)는 폴백으로 남긴다.
 
+// ── 수집기 순수 함수 시작 ── (tests/search-collector.test.js 가 여기부터 '수집기 DOM 함수 시작' 까지 잘라 쓴다)
 const COUPANG_ORIGIN = 'https://www.coupang.com';
 const COUPANG_PRODUCT_ID_RE = /\/vp\/products\/(\d+)/;
-// 긴 라벨을 앞에 둔다 — '판매자로켓' 안의 '로켓'이 '로켓배송' 등으로 오인되지 않게
+// 긴 라벨을 앞에 둔다 — '판매자로켓' 안의 '로켓'이 '로켓배송' 등으로 오인되지 않게.
+// 한 카드에 배지가 여럿이면 이 순서가 우선순위이기도 하다(판매자로켓을 로켓배송으로 올려 보지 않는다).
 const COUPANG_ROCKET_LABELS = ['판매자로켓', '로켓프레시', '로켓직구', '로켓배송'];
 
 // 숫자 문자열("33,900", "(2,785)", "33900원", 33900) → 정수. 못 읽으면 null — 값을 지어내지 않는다.
@@ -1923,26 +1941,140 @@ const csrTypeIs = (node, t) => {
   return ty === t || (Array.isArray(ty) && ty.includes(t));
 };
 
+// 숫자로만 된 id 문자열만 받는다(그 외는 null)
+const csrDigits = (v) => {
+  const s = v == null ? '' : String(v).trim();
+  return /^\d+$/.test(s) ? s : null;
+};
+
+// URL 생성자 없이 쿼리 파라미터 하나를 읽는다(JXA 테스트 겸용). 없으면 null.
+const csrQueryParam = (href, key) => {
+  const s = String(href || '');
+  const q = s.indexOf('?');
+  if (q < 0) return null;
+  const h = s.indexOf('#', q);
+  const qs = h < 0 ? s.slice(q + 1) : s.slice(q + 1, h);
+  for (const part of qs.split('&')) {
+    const eq = part.indexOf('=');
+    const k = eq < 0 ? part : part.slice(0, eq);
+    if (k !== key) continue;
+    const v = eq < 0 ? '' : part.slice(eq + 1);
+    try { return decodeURIComponent(v.replace(/\+/g, ' ')); } catch (_) { return v; }
+  }
+  return null;
+};
+
+// 검색 광고 카드의 링크는 sourceType=srp_product_ads 를 단다(실측 10/10)
+const csrIsAdHref = (href) => /[?&]sourceType=srp_product_ads(?=&|#|$)/.test(String(href || ''));
+
+// 카드 href → { productId, vendorItemId, itemId, rank, isAd }. rank 는 일반 상품에 붙는 쿠팡 순위.
+const csrParseProductHref = (href) => {
+  const s = String(href || '');
+  const rk = csrDigits(csrQueryParam(s, 'rank'));
+  return {
+    productId: csrProductId(s),
+    vendorItemId: csrDigits(csrQueryParam(s, 'vendorItemId')),
+    itemId: csrDigits(csrQueryParam(s, 'itemId')),
+    rank: rk && Number(rk) > 0 ? Number(rk) : null,
+    isAd: csrIsAdHref(s),
+  };
+};
+
+// '59,800원' → 59800. 금액만 있는 말단 텍스트일 때만 받는다('100원 / 와우 가입 쿠폰' 같은 문장은 null).
+const csrWonText = (t) => {
+  const m = /^\s*([\d,]+)\s*원\s*$/.exec(String(t == null ? '' : t));
+  if (!m) return null;
+  const n = csrInt(m[1]);
+  return n != null && n > 0 ? n : null;
+};
+
+// '27%' → 27. 1~99 만 할인율로 본다.
+const csrPercentText = (t) => {
+  const m = /^\s*(\d{1,3})\s*%\s*$/.exec(String(t == null ? '' : t));
+  if (!m) return null;
+  const n = Number(m[1]);
+  return n > 0 && n < 100 ? n : null;
+};
+
+// '(1,843)' → 1843. 괄호로 감싼 숫자만 리뷰 수로 본다.
+const csrReviewCountText = (t) => {
+  const m = /^\(\s*([\d,]+)\s*\)$/.exec(String(t == null ? '' : t).trim());
+  return m ? csrInt(m[1]) : null;
+};
+
+// 가격 영역의 말단 요소들 [{ text, inDel }] → { price, originalPrice, discountRate }.
+// 판매가 = del 밖에서 'N원' 인 첫 말단(뒤따르는 쿠폰 금액은 첫 매칭이 아니라 걸리지 않음),
+// 원가 = del 안의 'N원', 할인율 = 'N%' 인 첫 말단.
+const csrPickPriceLeaves = (leaves) => {
+  const out = { price: null, originalPrice: null, discountRate: null };
+  for (const lf of (Array.isArray(leaves) ? leaves : [])) {
+    if (!lf) continue;
+    const t = lf.text;
+    if (lf.inDel) {
+      if (out.originalPrice == null) out.originalPrice = csrWonText(t);
+    } else if (out.price == null) {
+      const w = csrWonText(t);
+      if (w != null) { out.price = w; continue; }
+    }
+    if (out.discountRate == null) out.discountRate = csrPercentText(t);
+  }
+  return out;
+};
+
+// img[data-badge-id] 값들 → 로켓 종류. TOMORROW(내일도착) 등 배송 약속 배지는 로켓이 아니다.
+// 실측: ROCKET→로켓배송, ROCKET_MERCHANT→판매자로켓. 로켓직구·로켓프레시는 계약의 접두 규칙.
+// 모르는 id 는 지어 붙이지 않고 무시한다.
+const csrRocketFromBadgeIds = (ids) => {
+  const found = new Set();
+  for (const raw of (Array.isArray(ids) ? ids : [])) {
+    const id = String(raw == null ? '' : raw).trim().toUpperCase();
+    if (!id) continue;
+    if (id === 'ROCKET') found.add('로켓배송');
+    else if (id === 'ROCKET_MERCHANT') found.add('판매자로켓');
+    else if (/^ROCKET_JIKGU/.test(id) || /^(ROCKET_)?GLOBAL/.test(id)) found.add('로켓직구');
+    else if (/^(ROCKET_)?FRESH/.test(id)) found.add('로켓프레시');
+  }
+  for (const lab of COUPANG_ROCKET_LABELS) if (found.has(lab)) return lab;
+  return null;
+};
+
+// 'RankMark_rank3__EWwz0' 같은 클래스 → 3
+const csrRankFromClassName = (cls) => {
+  const m = /RankMark_rank(\d+)/.exec(String(cls || ''));
+  return m && Number(m[1]) > 0 ? Number(m[1]) : null;
+};
+
 // 계약 1 의 item 틀. 모르는 값은 null; soldOut·adBadge 는 "표시를 못 봤다" 는 뜻의 false.
 const csrBlankItem = () => ({
-  name: null, price: null, originalPrice: null, url: null, image: null,
+  productId: null, vendorItemId: null, itemId: null,
+  name: null, price: null, originalPrice: null, discountRate: null,
   rating: null, reviewCount: null, rocket: null, freeShipping: null, soldOut: false, adBadge: false,
+  url: null, cleanUrl: null, image: null, searchRank: null, coupangRank: null,
 });
 
 // JSON-LD Product 한 개 → item. 이름도 URL 도 없으면 쓸모가 없으므로 null.
+// JSON-LD 의 url 은 추적 파라미터가 없는 깔끔한 상세 주소라 cleanUrl 로도 둔다.
 const csrItemFromJsonLdProduct = (p) => {
   if (!p || typeof p !== 'object' || Array.isArray(p)) return null;
   const it = csrBlankItem();
   it.name = (typeof p.name === 'string' && p.name.trim()) ? p.name.trim() : null;
   it.url = csrAbsUrl(typeof p.url === 'string' ? p.url : null);
+  it.cleanUrl = it.url;
+  if (it.url) {
+    const ids = csrParseProductHref(it.url);
+    it.productId = ids.productId;
+    it.vendorItemId = ids.vendorItemId;
+    it.itemId = ids.itemId;
+  }
   const img = Array.isArray(p.image) ? p.image[0] : p.image;
   it.image = typeof img === 'string' ? (csrAbsUrl(img) || null)
     : (img && typeof img.url === 'string' ? (csrAbsUrl(img.url) || null) : null);
   const offers = Array.isArray(p.offers) ? p.offers[0] : p.offers;
   if (offers && typeof offers === 'object') {
     const raw = (offers.price != null && offers.price !== '') ? offers.price : offers.lowPrice;
-    it.price = csrInt(raw);
-    // availability 는 계약엔 없지만 페이지가 명시한 품절 표시라 그대로 반영한다
+    const pr = csrInt(raw);
+    it.price = pr != null && pr > 0 ? pr : null;
+    // 페이지가 명시한 품절 표시라 그대로 반영한다
     if (/OutOfStock|SoldOut|Discontinued/i.test(String(offers.availability || ''))) it.soldOut = true;
   }
   const ar = p.aggregateRating;
@@ -1958,6 +2090,7 @@ const csrItemFromJsonLdProduct = (p) => {
 //  (a) {"@type":"ItemList","itemListElement":[{"@type":"ListItem","item":{Product}}]}
 //  (b) itemListElement 원소가 바로 Product
 //  (c) 최상위가 배열이거나 @graph 안에 ItemList
+//  (d) CollectionPage.mainEntity 가 ItemList (2026-10 쿠팡 실측 — 예전엔 이걸 못 봐 0개였다)
 // 파싱 실패·예상 밖 구조면 예외 없이 [] (또는 그때까지 모은 부분 결과).
 function parseCoupangSearchJsonLd(jsonText) {
   let data;
@@ -1965,11 +2098,14 @@ function parseCoupangSearchJsonLd(jsonText) {
   const out = [];
   try {
     const nodes = [];
+    const seen = new Set();
     const visit = (d) => {
-      if (!d || typeof d !== 'object') return;
+      if (!d || typeof d !== 'object' || seen.has(d)) return;
+      seen.add(d);
       if (Array.isArray(d)) { d.forEach(visit); return; }
       nodes.push(d);
       if (Array.isArray(d['@graph'])) d['@graph'].forEach(visit);
+      if (d.mainEntity && typeof d.mainEntity === 'object') visit(d.mainEntity);
     };
     visit(data);
     for (const node of nodes) {
@@ -1993,20 +2129,121 @@ function parseCoupangSearchJsonLd(jsonText) {
   return out;
 }
 
-// 쿠팡 검색 카드 셀렉터 후보군 — 배열 순서대로 첫 매칭을 쓴다. 앞쪽은 실측한 마크업
-// (li.search-product …), 뒤쪽은 CSS-module 식 클래스(ProductUnit_…·Price_…)로 바뀐 신형 마크업에
-// 대비한 부분 일치 폴백이다. 폴백은 실측 전이라, 안 맞으면 그 필드만 null 로 남긴다.
+// 순수 함수 — DOM 카드 items 를 JSON-LD 로 '보강만' 한다. DOM 카드 1개 = 원소 1개를 유지하고
+// productId 로 합치지 않는다(같은 상품이 광고·일반으로 두 번 나오면 두 원소). 비어 있는 값만 채운다.
+//  - vendorItemId 가 같은 JSON-LD 가 있으면 그것, 없으면 productId 가 같은 첫 JSON-LD.
+//  - productId 만 같고 vendorItemId 가 서로 다르면(다른 옵션) 상품 단위 값(이름·평점·리뷰 수)만 채운다 —
+//    가격·이미지·품절·cleanUrl 은 옵션마다 달라 남의 값을 붙이지 않는다.
+// JSON-LD 에만 있는 상품(화면에 카드 없음)은 넣지 않는다 — 클라이언트 이동 뒤 남은 이전 검색어의 JSON-LD 가
+// 화면에 없는 상품으로 순위를 채울 수 있고, 광고 여부도 알 수 없기 때문이다.
+// 단, DOM 카드가 하나도 없을 때만 JSON-LD 항목으로 대신한다(숨은 수집 탭에서 카드가 아직 안 그려진 경우 보호).
+// 그때 항목의 searchRank·coupangRank 는 null 이고, adBadge false 는 '광고 표시를 못 봤다'는 뜻이다.
+function csrEnrichWithJsonLd(domItems, ldItems) {
+  const ld = (Array.isArray(ldItems) ? ldItems : []).filter((x) => x && x.productId);
+  const byVendor = new Map();
+  const byProduct = new Map();
+  for (const it of ld) {
+    if (it.vendorItemId && !byVendor.has(it.vendorItemId)) byVendor.set(it.vendorItemId, it);
+    if (!byProduct.has(it.productId)) byProduct.set(it.productId, it);
+  }
+  const domPids = new Set();
+  const out = [];
+  for (const d0 of (Array.isArray(domItems) ? domItems : [])) {
+    if (!d0 || typeof d0 !== 'object') continue;
+    const d = Object.assign(csrBlankItem(), d0);
+    if (d.productId) domPids.add(d.productId);
+    let m = d.vendorItemId ? (byVendor.get(d.vendorItemId) || null) : null;
+    let sameOption = !!m;
+    if (!m && d.productId) {
+      m = byProduct.get(d.productId) || null;
+      sameOption = !!m && !(d.vendorItemId && m.vendorItemId && m.vendorItemId !== d.vendorItemId);
+    }
+    if (m) {
+      if (!d.name) d.name = m.name;
+      if (d.rating == null) d.rating = m.rating;
+      if (d.reviewCount == null) d.reviewCount = m.reviewCount;
+      if (sameOption) {
+        if (d.price == null) d.price = m.price;
+        if (!d.image) d.image = m.image;
+        if (!d.cleanUrl) d.cleanUrl = m.cleanUrl;
+        if (m.soldOut) d.soldOut = true;
+        if (!d.vendorItemId) d.vendorItemId = m.vendorItemId;
+        if (!d.itemId) d.itemId = m.itemId;
+      }
+    }
+    out.push(d);
+  }
+  if (out.length) return out;
+  const seenLd = new Set();
+  for (const m of ld) {
+    if (domPids.has(m.productId)) continue;
+    const key = m.vendorItemId ? 'v:' + m.vendorItemId : 'u:' + (m.cleanUrl || m.productId);
+    if (seenLd.has(key)) continue;
+    seenLd.add(key);
+    out.push(Object.assign(csrBlankItem(), m, { searchRank: null, coupangRank: null, adBadge: false }));
+  }
+  return out;
+}
+
+// 순수 함수 — 접근 거부·빈 페이지 판별. 상품 카드도 JSON-LD 상품도 0개면 순위를 매길 수 없는 페이지로 본다.
+// 본문에 쿠팡 접근 거부 문구('요청하신 페이지의 사용권한이 없습니다' 등)가 있으면 denied:true(확실한 차단).
+// 그 밖의 0개는 차단·로딩 실패·결과 없음을 가릴 수 없어 denied:false 로 둔다(단정하지 않는다).
+const CSR_DENIED_RE = /사용\s*권한이\s*없습니다|접근이\s*(?:거부|차단|제한)되었습니다|접근\s*권한이\s*없습니다|Access\s+Denied/i;
+function csrDetectBlocked(cardCount, ldCount, bodyText) {
+  const cards = Number(cardCount) > 0 ? Number(cardCount) : 0;
+  const lds = Number(ldCount) > 0 ? Number(ldCount) : 0;
+  if (cards > 0 || lds > 0) return { blocked: false, denied: false };
+  return { blocked: true, denied: CSR_DENIED_RE.test(String(bodyText == null ? '' : bodyText).slice(0, 20000)) };
+}
+
+// ── 순위 오버레이 문구 (순수 함수 — 같은 테스트가 함께 검사한다) ──
+const RANK_EXCLUDE_LABEL = {
+  ad: '광고 · 순위 제외', soldOut: '품절', current: '지금 보던 상품',
+  outlier: '가격 이상치 · 제외', accessory: '액세서리 · 제외', noSpec: '규격 확인 불가 · 제외',
+  // badUrl 은 표시하지 않는다
+};
+const rankOvScore = (v) => (v != null && v !== '' && Number.isFinite(Number(v)) ? String(Math.round(Number(v))) : '–');
+// 3축 점수 — '가격 100' 이 금액으로 읽히지 않게 호출하는 쪽에서 '점수' 를 앞에 붙인다.
+// 평점·리뷰가 없어 품질이 기본값이면 '품질 30(평점 없음)' 으로 측정값이 아님을 밝힌다.
+const rankOvAxes = (sc, dataInsufficient) => {
+  const s = sc && typeof sc === 'object' ? sc : {};
+  return `가격 ${rankOvScore(s.price)} · 품질 ${rankOvScore(s.quality)}${dataInsufficient ? '(평점 없음)' : ''} · 안정 ${rankOvScore(s.safety)}`;
+};
+// 제외 칩 문구. 광고 카드라도 같은 상품의 일반 카드가 순위에 있으면 '상품 제외'로 읽히지 않게 따로 말한다.
+const rankOvChipLabel = (why, rankedElsewhere) => {
+  if (why === 'ad') return rankedElsewhere ? '광고 · 순위는 일반 카드' : '광고 · 순위 제외';
+  return RANK_EXCLUDE_LABEL[why] || null;
+};
+// 패널 하단 — 제외 사유별 개수(0은 생략). '검색 결과 N개'·'M개 순위' 와 같은 상품 단위로 센다.
+// 광고는 '광고로만 나온 상품' 수다 — 같은 상품이 일반 카드로도 나오면 그 상품은 순위에 들어 있다.
+function rankOvFooterText(count, rankedCount, excluded) {
+  const ex = Array.isArray(excluded) ? excluded : [];
+  const n = (why) => ex.filter((x) => x && x.why === why).length;
+  const parts = [
+    ['광고 상품', n('ad')],
+    ['품절', n('soldOut')], ['액세서리', n('accessory')], ['가격 이상치', n('outlier')],
+    ['규격 확인 불가', n('noSpec')], ['지금 보던 상품', n('current')], ['링크 확인 불가', n('badUrl')],
+  ].filter((p) => p[1] > 0).map((p) => `${p[0]} ${p[1]}`);
+  return `검색 결과 ${count}개 중 ${rankedCount}개 순위`
+    + (parts.length ? ` · 제외: ${parts.join('·')}` : '')
+    + ' · 페이지의 가격·평점·리뷰·배송 정보로 계산했어요';
+}
+
+// ── 수집기 DOM 함수 시작 ── (여기부터는 document 를 읽는다)
+// 셀렉터 후보군 — 배열 순서대로 첫 매칭을 쓴다. 신형 실측 셀렉터는 csrReadCard 가 먼저 보고,
+// 이 표는 신형에서 못 읽었을 때의 구형(li.search-product …)·부분 일치 폴백이다.
 const CSR_SEL = {
   item:        ['li.search-product', 'li[class*="ProductUnit_productUnit"]', 'ul#productList > li', 'ul[class*="ProductList"] > li'],
   link:        ['a.search-product-link', 'a[href*="/vp/products/"]'],
-  name:        ['.name', '[class*="ProductUnit_productName"]', '[class*="productName"]'],
+  name:        ['[class*="ProductUnit_productName"]', '.name', '[class*="productName"]'],
   price:       ['.price-value', '[class*="Price_priceValue"]', '[class*="priceValue"]'],
   basePrice:   ['.base-price', '[class*="Price_basePrice"]', '[class*="basePrice"]', 'del'],
   rating:      ['.rating', '[class*="ProductRating_star"]'],
   ratingCount: ['.rating-total-count', '[class*="ProductRating_ratingCount"]', '[class*="ratingCount"]'],
-  image:       ['img.search-product-wrap-img', 'img[class*="ProductUnit_productImage"]', 'img[class*="productImage"]', 'img'],
+  image:       ['figure img', 'img.search-product-wrap-img', 'img[class*="ProductUnit_productImage"]', 'img[class*="productImage"]', 'img'],
   rocket:      ['.badge.rocket', '[class*="ImageBadge"]', '[class*="badge"]'],
-  soldOut:     ['.out-of-stock', '[class*="ProductUnit_soldOut"]', '[class*="soldOut"]', '[class*="out-of-stock"]'],
+  // 신형 품절 클래스는 소문자 o(ProductUnit_soldout___…). class 속성 부분 일치는 대소문자를 가린다.
+  soldOut:     ['[class*="ProductUnit_soldout"]', '.out-of-stock', '[class*="ProductUnit_soldOut"]', '[class*="soldOut"]', '[class*="out-of-stock"]'],
   ad:          ['.ad-badge', '[class*="ad-badge"]', '[class*="AdMark"]'],
 };
 
@@ -2017,7 +2254,9 @@ const csrFirst = (root, sels) => {
   return null;
 };
 
-// 로켓 배지 — 구형·신형 모두 <img alt="로켓배송"> 꼴이라 alt 를 먼저 보고, 없으면 배지 텍스트.
+const csrText = (el) => (el && el.textContent || '').replace(/\s+/g, ' ').trim();
+
+// 구형 로켓 판별 — <img alt="로켓배송"> 꼴이면 alt, 없으면 배지 텍스트.
 // 카드 본문 텍스트는 보지 않는다(상품명에 '로켓'이 들어가도 배송 방식이 아니다).
 const csrRocketOf = (li) => {
   const imgs = li.querySelectorAll('img[alt]');
@@ -2030,100 +2269,165 @@ const csrRocketOf = (li) => {
   return null;
 };
 
-// DOM 폴백 — 검색 카드(li)마다 계약 1 의 item 을 만든다. 로켓·품절·광고·원가는 JSON-LD 에
-// 없어서 여기서만 얻는다.
+// 페이지의 상품 카드 li 들(노출 순서). 한정 시간 특가 캐러셀(li.limited-time-offer)은 상품 카드가 아니다.
+function csrCardElements() {
+  let lis = [];
+  try { lis = Array.from(document.querySelectorAll('#product-list > li[class*="ProductUnit_productUnit"]')); } catch (_) { lis = []; }
+  if (!lis.length) {
+    for (const sel of CSR_SEL.item) {
+      try { lis = Array.from(document.querySelectorAll(sel)); } catch (_) { lis = []; }
+      if (lis.length) break;
+    }
+  }
+  return lis.filter((li) => {
+    try { return !li.closest('.limited-time-offer'); } catch (_) { return true; }
+  });
+}
+
+const csrCardLink = (li) => {
+  try {
+    const direct = li.querySelector(':scope > a[href*="/vp/products/"]');
+    if (direct) return direct;
+  } catch (_) {}
+  return csrFirst(li, CSR_SEL.link);
+};
+
+// 광고 카드인가 — href 의 sourceType, 'Ad information' 버튼, 정확히 '광고' 인 말단 span, 구형 광고 클래스.
+const csrCardIsAd = (li, href) => {
+  if (csrIsAdHref(href)) return true;
+  try { if (li.querySelector('button[aria-label="Ad information"]')) return true; } catch (_) {}
+  try {
+    for (const sp of li.querySelectorAll('span')) {
+      if (!sp.children.length && (sp.textContent || '').trim() === '광고') return true;
+    }
+  } catch (_) {}
+  if (csrFirst(li, CSR_SEL.ad)) return true;
+  return /ad-badge/.test(String(li.getAttribute('class') || ''));
+};
+
+// 카드 li 하나 → 계약 1 의 item. index 는 카드 노출 순서(0부터, 광고 포함).
+function csrReadCard(li, index, base) {
+  const it = csrBlankItem();
+  const a = csrCardLink(li);
+  const href = a ? (a.getAttribute('href') || '') : '';
+  it.url = href ? csrAbsUrl(href, base) : null;
+  const ids = csrParseProductHref(it.url || href);
+  it.productId = ids.productId;
+  it.vendorItemId = csrDigits(li.getAttribute('data-id')) || ids.vendorItemId;
+  it.itemId = ids.itemId;
+  it.searchRank = index + 1;
+
+  // 이름 — 상품명 요소, 없으면 상품 이미지 alt(신형은 상품명과 같음)
+  it.name = csrText(csrFirst(li, CSR_SEL.name)) || null;
+  if (!it.name) {
+    const im = li.querySelector('figure img[alt]');
+    const alt = im ? (im.getAttribute('alt') || '').replace(/\s+/g, ' ').trim() : '';
+    if (alt) it.name = alt;
+  }
+
+  // 가격 — 신형 가격 영역의 말단 요소에서. 없으면 구형 셀렉터.
+  const pa = li.querySelector('[class*="PriceArea_priceArea"]');
+  if (pa) {
+    const leaves = Array.from(pa.querySelectorAll('*'))
+      .filter((e) => !e.children.length)
+      .map((e) => ({ text: e.textContent || '', inDel: !!e.closest('del') }));
+    const p = csrPickPriceLeaves(leaves);
+    it.price = p.price;
+    it.originalPrice = p.originalPrice;
+    it.discountRate = p.discountRate;
+    if (it.originalPrice == null) {
+      const del = pa.querySelector('del');
+      const n = del ? csrInt(del.textContent) : null;
+      if (n != null && n > 0) it.originalPrice = n;
+    }
+  } else {
+    const priceEl = csrFirst(li, CSR_SEL.price);
+    const pr = priceEl ? csrInt(priceEl.textContent) : null;
+    it.price = pr != null && pr > 0 ? pr : null;
+    const baseEl = csrFirst(li, CSR_SEL.basePrice);
+    const bp = baseEl ? csrInt(baseEl.textContent) : null;
+    it.originalPrice = bp != null && bp > 0 ? bp : null;
+  }
+
+  // 평점·리뷰 수 — 신형은 aria-label 과 '(N)' span. 평점 영역 자체가 없으면 구형 셀렉터.
+  const rr = li.querySelector('[class*="ProductRating_productRating"]');
+  if (rr) {
+    const al = rr.querySelector('[aria-label]') || (rr.hasAttribute('aria-label') ? rr : null);
+    it.rating = al ? csrNum(al.getAttribute('aria-label')) : null;
+    for (const sp of rr.querySelectorAll('span')) {
+      const n = csrReviewCountText(sp.textContent);
+      if (n != null) { it.reviewCount = n; break; }
+    }
+  } else {
+    const ratingEl = csrFirst(li, CSR_SEL.rating);
+    if (ratingEl) {
+      it.rating = csrNum(ratingEl.textContent);
+      // 구형 마크업은 숫자 없이 별 채움 너비(%)만 있다 → 5점 환산 (ratingFromStarWidth 와 같은 방식)
+      if (it.rating == null) {
+        const w = String(ratingEl.getAttribute('style') || '').match(/width\s*:\s*(\d+(?:\.\d+)?)%/);
+        if (w) it.rating = csrNum(Math.round(Number(w[1]) / 20 * 10) / 10);
+      }
+    }
+    const cntEl = csrFirst(li, CSR_SEL.ratingCount);
+    it.reviewCount = cntEl ? csrInt(cntEl.textContent) : null;
+  }
+
+  // 이미지 — 배지 이미지(data-badge-id·로켓 alt)는 상품 이미지가 아니다. 지연 로딩이면 data-img-src 가 진짜 주소.
+  let imgEl = null;
+  for (const sel of CSR_SEL.image) {
+    try {
+      imgEl = Array.from(li.querySelectorAll(sel)).find((im) => !im.hasAttribute('data-badge-id') && !csrRocketLabel(im.getAttribute('alt'))) || null;
+    } catch (_) { imgEl = null; }
+    if (imgEl) break;
+  }
+  if (imgEl) {
+    const src = imgEl.getAttribute('data-img-src') || imgEl.getAttribute('src') || imgEl.getAttribute('data-src');
+    const abs = csrAbsUrl(src, base);
+    it.image = abs && /^https?:/i.test(abs) ? abs : null;
+  }
+
+  // 로켓 — 신형은 img[data-badge-id] 가 근거. 배지 id 가 하나도 없을 때만 구형 alt·텍스트 판별.
+  const badgeIds = Array.from(li.querySelectorAll('img[data-badge-id]')).map((im) => im.getAttribute('data-badge-id'));
+  it.rocket = csrRocketFromBadgeIds(badgeIds);
+  if (!it.rocket && !badgeIds.length) it.rocket = csrRocketOf(li);
+
+  // '무료배송' 표시가 없다고 유료배송이라 단정할 수 없어(로켓 상품은 글자 없이 무료) 못 봤으면 null
+  it.freeShipping = (li.textContent || '').includes('무료배송') ? true : null;
+  // '품절임박'·'단 N개 남음'은 재고가 적다는 뜻일 뿐 품절이 아니다 — 품절 클래스만 본다
+  it.soldOut = !!csrFirst(li, CSR_SEL.soldOut);
+  it.adBadge = csrCardIsAd(li, href);
+  // 쿠팡 순위는 일반 상품에만 — RankMark 표시(상위 10개) 또는 href 의 rank=
+  if (!it.adBadge) {
+    const rm = li.querySelector('[class*="RankMark_rank"]');
+    it.coupangRank = (rm ? csrRankFromClassName(rm.getAttribute('class')) : null) || ids.rank;
+  }
+  return it;
+}
+
+// DOM 카드 → items[] (카드 1개 = 원소 1개, 노출 순서). 이름도 링크도 없는 카드는 건너뛴다.
 function collectCoupangSearchDom() {
   const out = [];
-  let lis = [];
-  for (const sel of CSR_SEL.item) {
-    try { lis = Array.from(document.querySelectorAll(sel)); } catch (_) { lis = []; }
-    if (lis.length) break;
-  }
   const base = location.href;
-  for (const li of lis) {
+  csrCardElements().forEach((li, i) => {
     try {
-      const it = csrBlankItem();
-      const a = csrFirst(li, CSR_SEL.link);
-      it.url = a ? csrAbsUrl(a.getAttribute('href'), base) : null;
-      const nameEl = csrFirst(li, CSR_SEL.name);
-      it.name = nameEl ? ((nameEl.textContent || '').replace(/\s+/g, ' ').trim() || null) : null;
-      const priceEl = csrFirst(li, CSR_SEL.price);
-      it.price = priceEl ? csrInt(priceEl.textContent) : null;
-      const baseEl = csrFirst(li, CSR_SEL.basePrice);
-      it.originalPrice = baseEl ? csrInt(baseEl.textContent) : null;
-      const ratingEl = csrFirst(li, CSR_SEL.rating);
-      if (ratingEl) {
-        it.rating = csrNum(ratingEl.textContent);
-        // 신형 마크업은 숫자 없이 별 채움 너비(%)만 있다 → 5점 환산 (ratingFromStarWidth 와 같은 방식)
-        if (it.rating == null) {
-          const w = String(ratingEl.getAttribute('style') || '').match(/width\s*:\s*(\d+(?:\.\d+)?)%/);
-          if (w) it.rating = Math.round(Number(w[1]) / 20 * 10) / 10;
-        }
-      }
-      const cntEl = csrFirst(li, CSR_SEL.ratingCount);
-      it.reviewCount = cntEl ? csrInt(cntEl.textContent) : null;
-      const imgEl = csrFirst(li, CSR_SEL.image);
-      // 지연 로딩이면 src 는 자리표시자이고 data-img-src 가 진짜 주소. 배지 이미지는 상품 이미지가 아니다.
-      if (imgEl && !csrRocketLabel(imgEl.getAttribute('alt'))) {
-        it.image = csrAbsUrl(imgEl.getAttribute('data-img-src') || imgEl.getAttribute('src') || imgEl.getAttribute('data-src'), base);
-      }
-      it.rocket = csrRocketOf(li);
-      it.soldOut = !!csrFirst(li, CSR_SEL.soldOut);
-      it.adBadge = !!csrFirst(li, CSR_SEL.ad) || /ad-badge/.test(String(li.getAttribute('class') || ''));
-      // '무료배송' 표시가 없다고 유료배송이라 단정할 수 없어(로켓 상품은 글자 없이 무료) 못 봤으면 null
-      it.freeShipping = (li.textContent || '').includes('무료배송') ? true : null;
-      if (!it.name && !it.url) continue;
-      out.push(it);
+      const it = csrReadCard(li, i, base);
+      if (it.name || it.url) out.push(it);
     } catch (_) {}
-  }
+  });
   return out;
 }
 
-// 순수 함수 — JSON-LD 와 DOM 을 productId(/vp/products/{id}) 기준으로 병합한다.
-// 같은 상품이면 평점·리뷰·가격은 JSON-LD 를, 로켓·품절·광고·무료배송·원가는 DOM 을 우선한다
-// (각 값이 믿을 만하게 있는 쪽). 한쪽에만 있으면 그대로. 같은 productId 가 두 번 나오면 먼저 본 것만.
-function mergeCoupangSearchItems(ldItems, domItems) {
-  const keyOf = (it) => csrProductId(it.url) || (it.url ? 'url:' + it.url : (it.name ? 'name:' + it.name : null));
-  const map = new Map();
-  for (const it of (ldItems || [])) {
-    const k = keyOf(it);
-    if (k && !map.has(k)) map.set(k, { ld: it, dom: null });
-  }
-  for (const it of (domItems || [])) {
-    const k = keyOf(it);
-    if (!k) continue;
-    const e = map.get(k);
-    if (e) { if (!e.dom) e.dom = it; } else map.set(k, { ld: null, dom: it });
-  }
-  const out = [];
-  for (const { ld, dom } of map.values()) {
-    if (!ld || !dom) { out.push(ld || dom); continue; }
-    out.push({
-      name: ld.name || dom.name || null,
-      price: ld.price != null ? ld.price : dom.price,
-      originalPrice: dom.originalPrice != null ? dom.originalPrice : ld.originalPrice,
-      url: ld.url || dom.url || null,
-      image: ld.image || dom.image || null,
-      rating: ld.rating != null ? ld.rating : dom.rating,
-      reviewCount: ld.reviewCount != null ? ld.reviewCount : dom.reviewCount,
-      rocket: dom.rocket || ld.rocket || null,
-      freeShipping: dom.freeShipping != null ? dom.freeShipping : ld.freeShipping,
-      soldOut: !!(dom.soldOut || ld.soldOut),
-      adBadge: !!(dom.adBadge || ld.adBadge),
-    });
-  }
-  return out;
-}
-
-// 쿠팡 검색 결과 페이지인가 — hostname 이 coupang.com(또는 그 하위)이고 경로가 /np/search 로 시작
-const isCoupangSearchPage = () => {
+// 쿠팡 검색 결과 페이지인가 — hostname 이 coupang.com(또는 그 하위)이고 경로가 /np/search 로 시작.
+// 함수 선언으로 둔다: 파일 앞쪽(다크패턴 감시 시작부)에서도 호출하므로 호이스팅이 필요하다.
+function isCoupangSearchPage() {
   try {
     const h = String(location.hostname || '');
     return (h === 'coupang.com' || h.endsWith('.coupang.com')) && String(location.pathname || '').startsWith('/np/search');
   } catch (_) { return false; }
-};
+}
 
-// background 요청 1회 → 계약 1 응답. 모든 ld+json 을 파싱해 DOM 수집과 병합한다.
+// 계약 1 응답. 모든 ld+json 을 파싱해 DOM 카드 items 를 보강한다.
+// 카드도 JSON-LD 상품도 0개면 ok:false, error:'blocked' (denied:true 면 접근 거부 문구를 본 것).
 function collectCoupangSearchResults() {
   if (!isCoupangSearchPage()) return { ok: false, error: 'not-search-page' };
   try {
@@ -2131,7 +2435,14 @@ function collectCoupangSearchResults() {
     document.querySelectorAll('script[type="application/ld+json"]').forEach((s) => {
       for (const it of parseCoupangSearchJsonLd(s.textContent || '')) ld.push(it);
     });
-    const items = mergeCoupangSearchItems(ld, collectCoupangSearchDom());
+    const dom = collectCoupangSearchDom();
+    const ldCount = ld.filter((x) => x && x.productId).length;
+    // 본문 텍스트는 둘 다 0개일 때만 읽는다(정상 페이지에서 목록 전체 텍스트를 만들지 않게)
+    // innerText: 화면에 보이는 글자만 — 인라인 script(Next.js 데이터)에 든 문구로 '접근 거부'를 오판하지 않게
+    const bodyText = (dom.length || ldCount) ? '' : ((document.body && document.body.innerText) || '');
+    const bl = csrDetectBlocked(dom.length, ldCount, bodyText);
+    if (bl.blocked) return { ok: false, error: 'blocked', denied: bl.denied };
+    const items = csrEnrichWithJsonLd(dom, ld);
     return { ok: true, source: 'coupang', url: location.href, count: items.length, items };
   } catch (e) {
     return { ok: false, error: 'collect-failed: ' + ((e && e.message) || String(e)) };
@@ -2167,3 +2478,510 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
 });
+
+// ── 쿠팡 검색 페이지 ShoMate 3축 순위 오버레이 ─────────────────────
+// 사용자가 사이드바의 '쿠팡 검색 창에서 순위 보기' 버튼으로 연 탭(background 의 rankTabs)에서만 그린다.
+// 일반 쿠팡 검색이나 background 가 몰래 여는 수집 탭은 rankTabStatus 가 isRankTab:false 라 아무것도 하지 않는다.
+// 흐름: rankTabStatus → (순위 탭이면) 카드가 나타날 때까지 최대 10초 기다림 → 수집 → rankSearchItems
+//       → 카드 배지 + 고정 패널. 목록이 바뀌면(MutationObserver·URL 변화) 다시 수집·순위.
+// 규칙: 쿠팡 DOM 의 순서는 바꾸지 않는다(배지는 li 의 마지막 자식으로 덧붙일 뿐). 페이지·background 에서 온
+//       문자열은 textContent 로만 넣는다. 확장이 재로드돼 컨텍스트가 끊기면 조용히 멈춘다.
+const RANK_OV = {
+  active: false, dead: false, seq: 0, busy: false, pending: false,
+  result: null, itemCount: 0, lastSig: '', lastHref: '', badgeCount: 0,
+  obs: null, obsTarget: null, debounce: null, poll: null,
+  panel: null, collapsed: false, config: null, panelArgs: null,
+  // 카드 0개 상태 추적 — 클라이언트 이동 뒤 10초 넘게 카드가 없으면 이전 순위를 지운다
+  emptySince: null, emptyShown: false, sawCards: false, navigated: false,
+  saved: new Map(),   // li → 배지 붙이기 전 inline style(boxShadow·position). 지울 때 되돌린다.
+};
+const RANK_EMPTY_GRACE_MS = 10000;
+const RANK_EMPTY_TEXT = '이 페이지에서 상품 정보를 읽지 못해 순위를 매기지 못했어요.';
+const RANK_PANEL_ID = 'shomate-rank-panel';
+const RANK_INDIGO = '#4f46e5';
+const RANK_FONT = '-apple-system,"Malgun Gothic",sans-serif';
+// RANK_EXCLUDE_LABEL·rankOvScore·rankOvAxes·rankOvChipLabel·rankOvFooterText 는 위 '순위 오버레이 문구' 순수 구간에 있다.
+const rankOvNarrow = (px) => { try { const w = Number(window.innerWidth); return w > 0 && w <= px; } catch (_) { return false; } };
+
+function rankOvStop() {
+  RANK_OV.dead = true;
+  RANK_OV.active = false;
+  if (RANK_OV.obs) { try { RANK_OV.obs.disconnect(); } catch (_) {} RANK_OV.obs = null; }
+  clearTimeout(RANK_OV.debounce);
+  clearInterval(RANK_OV.poll);
+}
+
+// background 로 메시지. 확장 재로드로 컨텍스트가 끊기면 sendMessage 가 throw 하거나 runtime.id 가 사라진다 → 조용히 중단.
+// 받는 쪽이 없거나 응답이 없으면 lastError → cb(null).
+function rankOvSend(msg, cb) {
+  if (RANK_OV.dead) return;
+  try {
+    if (!chrome.runtime || !chrome.runtime.id) { rankOvStop(); return; }
+    chrome.runtime.sendMessage(msg, (res) => {
+      let err = null;
+      try { err = chrome.runtime.lastError || null; } catch (_) { err = true; }
+      try { cb(err ? null : res); } catch (_) {}
+    });
+  } catch (_) {
+    rankOvStop();
+  }
+}
+
+// 지금 페이지의 카드들 [{ li, productId, adBadge }] (노출 순서)
+function rankOvCardInfos() {
+  const out = [];
+  for (const li of csrCardElements()) {
+    try {
+      const a = csrCardLink(li);
+      const href = a ? (a.getAttribute('href') || '') : '';
+      const pid = csrProductId(href);
+      if (!pid) continue;
+      out.push({ li, productId: pid, adBadge: csrCardIsAd(li, href) });
+    } catch (_) {}
+  }
+  return out;
+}
+const rankOvSig = (infos) => Array.from(new Set(infos.map((c) => c.productId))).sort().join(',');
+
+// 쿠팡 상품 상세만 연다(검색·카테고리 URL 이나 다른 사이트로 보내지 않는다)
+function rankOvOpen(link) {
+  const s = String(link || '');
+  if (!/^https:\/\/(?:www\.)?coupang\.com\/vp\/products\/\d+/.test(s)) return;
+  try { window.open(s, '_blank', 'noopener'); } catch (_) {}
+}
+
+const rankOvFmtWon = (n) => (Number.isFinite(Number(n)) && Number(n) > 0) ? Math.round(Number(n)).toLocaleString('ko-KR') + '원' : '가격 미확인';
+
+// 우리가 방금 붙이거나 지운 배지의 변경 기록은 감시 콜백에 넘기지 않고 버린다(자기 변경으로 재순위하지 않게).
+// 그래서 콜백은 남이(쿠팡 재렌더가) 우리 배지를 지운 것을 '변화'로 볼 수 있다.
+function rankOvDropOwnRecords() {
+  if (RANK_OV.obs) { try { RANK_OV.obs.takeRecords(); } catch (_) {} }
+}
+
+function rankOvClearBadges() {
+  try { document.querySelectorAll('[data-shomate-rank]').forEach((el) => el.remove()); } catch (_) {}
+  for (const [li, s] of RANK_OV.saved) {
+    try { li.style.boxShadow = s.boxShadow; li.style.position = s.position; } catch (_) {}
+  }
+  RANK_OV.saved.clear();
+  RANK_OV.badgeCount = 0;
+  rankOvDropOwnRecords();
+}
+
+function rankOvClearAll() {
+  rankOvClearBadges();
+  if (RANK_OV.panel) { RANK_OV.panel.remove(); RANK_OV.panel = null; }
+}
+
+function rankOvPrepCard(li, highlight) {
+  if (!RANK_OV.saved.has(li)) RANK_OV.saved.set(li, { boxShadow: li.style.boxShadow, position: li.style.position });
+  // 신형 카드 li 는 이미 position:relative(실측). 구형처럼 static 이면 배지 기준을 위해서만 relative 로.
+  try { if (getComputedStyle(li).position === 'static') li.style.position = 'relative'; } catch (_) {}
+  if (highlight) li.style.boxShadow = 'inset 0 0 0 3px ' + RANK_INDIGO;
+}
+
+// 배지·칩은 카드 우상단 — 쿠팡 순위 표시(RankMark)·쿠픽 배지가 있는 좌상단을 가리지 않게.
+const RANK_BADGE_BASE = [
+  'position:absolute', 'top:6px', 'right:6px', 'left:auto', 'z-index:5',
+  'max-width:calc(100% - 12px)', 'box-sizing:border-box',
+  'border-radius:8px', 'padding:3px 7px',
+  'box-shadow:0 2px 8px rgba(0,0,0,0.18)',
+  'white-space:nowrap', 'overflow:hidden', 'text-overflow:ellipsis', 'text-align:left',
+];
+// 폭 600px 이하(쿠팡이 한 줄 리스트로 바꾸고 썸네일이 작아지는 폭)에서는 글자를 10px 로
+const rankOvBadgeFont = (weight) => `font:${weight} ${rankOvNarrow(600) ? 10 : 12}px/1.3 ${RANK_FONT}`;
+
+// 순위 배지 — 한 줄 'ShoMate {rank}위 · {total}점'. 3축은 title 툴팁으로만.
+function rankOvMakeBadge(entry) {
+  const top3 = Number(entry.rank) <= 3;
+  const b = document.createElement('div');
+  b.setAttribute('data-shomate-rank', String(entry.rank));
+  b.setAttribute('role', 'link');
+  b.title = `점수 — ${rankOvAxes(entry.scores, !!entry.dataInsufficient)}\n누르면 상품 상세를 새 탭으로 열어요`;
+  b.style.cssText = RANK_BADGE_BASE.concat(top3
+    ? ['background:' + RANK_INDIGO, 'color:#fff', 'border:1px solid ' + RANK_INDIGO]
+    : ['background:#fff', 'color:#3730a3', 'border:1px solid #a5b4fc'],
+  ['cursor:pointer', 'pointer-events:auto', rankOvBadgeFont(800)]).join(';');
+  b.textContent = `ShoMate ${rankOvScore(entry.rank)}위 · ${rankOvScore(entry.scores && entry.scores.total)}점`;
+  // 배지는 a 의 형제라 원래 링크로 이어지지 않지만, ul 의 React 핸들러로도 올라가지 않게 막는다
+  b.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); rankOvOpen(entry.link); });
+  return b;
+}
+
+// 제외 칩 — 클릭을 받지 않는다(pointer-events:none). 칩 자리를 눌러도 원래 카드 링크로 간다.
+function rankOvMakeChip(why, rankedElsewhere) {
+  const label = rankOvChipLabel(why, rankedElsewhere);
+  if (!label) return null;
+  const c = document.createElement('div');
+  c.setAttribute('data-shomate-rank', 'excluded-' + why);
+  c.style.cssText = RANK_BADGE_BASE.concat(['background:#f3f4f6', 'color:#4b5563', 'border:1px solid #d1d5db',
+    'pointer-events:none', rankOvBadgeFont(700)]).join(';');
+  c.textContent = label;
+  return c;
+}
+
+// 카드마다 배지·칩. 같은 productId 카드가 여럿이면 순위 배지는 대표(광고 아닌 첫) 카드에만.
+// 광고 카드는 같은 상품이 순위에 있으면 '광고 · 순위는 일반 카드', 광고로만 나왔으면 '광고 · 순위 제외'.
+function rankOvRenderBadges(result) {
+  rankOvClearBadges();
+  const ranked = new Map();
+  for (const r of (Array.isArray(result.ranked) ? result.ranked : [])) {
+    if (r && r.productId != null && !ranked.has(String(r.productId))) ranked.set(String(r.productId), r);
+  }
+  const excluded = new Map();
+  for (const x of (Array.isArray(result.excluded) ? result.excluded : [])) {
+    if (x && x.productId != null && !excluded.has(String(x.productId))) excluded.set(String(x.productId), x.why);
+  }
+  const infos = rankOvCardInfos();
+  const rep = new Map();
+  for (const ci of infos) if (!ci.adBadge && !rep.has(ci.productId)) rep.set(ci.productId, ci.li);
+  let n = 0;
+  for (const ci of infos) {
+    let node = null;
+    let highlight = false;
+    if (ci.adBadge) {
+      node = rankOvMakeChip('ad', ranked.has(ci.productId));
+    } else if (ranked.has(ci.productId)) {
+      if (rep.get(ci.productId) !== ci.li) continue;
+      const e = ranked.get(ci.productId);
+      node = rankOvMakeBadge(e);
+      highlight = Number(e.rank) <= 3;
+    } else if (excluded.has(ci.productId)) {
+      node = rankOvMakeChip(excluded.get(ci.productId), false);
+    }
+    if (!node) continue;
+    try { rankOvPrepCard(ci.li, highlight); ci.li.appendChild(node); n++; } catch (_) {}
+  }
+  RANK_OV.badgeCount = n;
+  rankOvDropOwnRecords();
+}
+
+function rankOvLocate(productId) {
+  const infos = rankOvCardInfos();
+  const ci = infos.find((c) => c.productId === productId && !c.adBadge) || infos.find((c) => c.productId === productId);
+  if (!ci) return;
+  const li = ci.li;
+  try { li.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch (_) {}
+  const prev = li.style.outline;
+  let k = 0;
+  const t = setInterval(() => {
+    try { li.style.outline = (k % 2 === 0) ? '3px solid #f59e0b' : prev; } catch (_) {}
+    if (++k >= 6) { clearInterval(t); try { li.style.outline = prev; } catch (_) {} }
+  }, 300);
+}
+
+const rankOvSmallBtn = (label, title) => {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.textContent = label;
+  if (title) b.title = title;
+  b.style.cssText = `background:none;border:1px solid #c7d2fe;border-radius:6px;cursor:pointer;color:${RANK_INDIGO};font:700 11px/1 ${RANK_FONT};padding:3px 6px`;
+  return b;
+};
+
+// 접힌 상태 — 작은 알약. 누르면 패널을 다시 연다(✕ 로 닫아도 이 알약은 남는다).
+function rankOvRenderPill() {
+  const pill = document.createElement('button');
+  pill.type = 'button';
+  pill.id = RANK_PANEL_ID;
+  const pillErr = RANK_OV.panelArgs && RANK_OV.panelArgs[1];
+  pill.textContent = pillErr ? 'ShoMate 순위 ⚠' : 'ShoMate 순위 ▸';
+  pill.title = pillErr ? `${pillErr} (눌러서 자세히 보기)` : 'ShoMate 3축 순위 패널 열기';
+  pill.style.cssText = [
+    'position:fixed', 'top:120px', 'right:16px', 'width:auto', 'z-index:2147483644',
+    'background:' + RANK_INDIGO, 'color:#fff', 'border:none', 'border-radius:999px',
+    'padding:7px 12px', 'cursor:pointer', 'box-shadow:0 6px 18px rgba(0,0,0,0.2)',
+    `font:800 12px/1 ${RANK_FONT}`, 'white-space:nowrap',
+  ].join(';');
+  pill.addEventListener('click', () => {
+    RANK_OV.collapsed = false;
+    const args = RANK_OV.panelArgs || [null, null];
+    rankOvRenderPanel(args[0], args[1]);
+  });
+  document.documentElement.appendChild(pill);
+  RANK_OV.panel = pill;
+}
+
+// 고정 패널. result 가 없으면 errorText 를 보여준다(순위를 못 매긴 이유를 숨기지 않는다).
+// 접힌 상태(RANK_OV.collapsed)면 알약만 그린다. 폭 768px 이하에서는 처음부터 접힌 채로 시작한다(rankOvInit).
+function rankOvRenderPanel(result, errorText) {
+  if (RANK_OV.panel) { RANK_OV.panel.remove(); RANK_OV.panel = null; }
+  RANK_OV.panelArgs = [result, errorText];
+  if (RANK_OV.collapsed) { rankOvRenderPill(); return; }
+  const box = document.createElement('div');
+  box.id = RANK_PANEL_ID;
+  box.style.cssText = [
+    'position:fixed', 'top:120px', 'right:16px', 'width:320px', 'max-width:calc(100vw - 32px)',
+    'max-height:calc(100vh - 140px)', 'overflow:auto', 'box-sizing:border-box',
+    'z-index:2147483644', 'background:#fff', 'border:1px solid #c7d2fe', 'border-radius:14px',
+    'box-shadow:0 10px 30px rgba(0,0,0,0.18)', 'padding:12px 14px',
+    `font:400 12px/1.45 ${RANK_FONT}`, 'color:#1e1b4b', 'text-align:left',
+  ].join(';');
+
+  const head = document.createElement('div');
+  head.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:8px';
+  const title = document.createElement('strong');
+  title.textContent = 'ShoMate 3축 순위';
+  title.style.cssText = `font:800 14px/1.2 ${RANK_FONT};color:${RANK_INDIGO}`;
+  const btns = document.createElement('div');
+  btns.style.cssText = 'display:flex;gap:4px';
+  const fold = rankOvSmallBtn('접기', '패널을 작은 알약으로 접어요');
+  const close = rankOvSmallBtn('✕', '패널 닫기 — 오른쪽 위 알약으로 남아 다시 열 수 있어요');
+  btns.appendChild(fold);
+  btns.appendChild(close);
+  head.appendChild(title);
+  head.appendChild(btns);
+  box.appendChild(head);
+
+  const body = document.createElement('div');
+  body.style.cssText = 'margin-top:6px';
+  const collapse = () => { RANK_OV.collapsed = true; rankOvRenderPanel(result, errorText); };
+  fold.addEventListener('click', collapse);
+  close.addEventListener('click', collapse);
+
+  const cfg = result || RANK_OV.config || {};
+  const w = cfg.weights && typeof cfg.weights === 'object' ? cfg.weights : null;
+  const sub = document.createElement('div');
+  const subParts = [];
+  if (cfg.query) subParts.push(`「${cfg.query}」`);
+  if (cfg.priority) subParts.push(String(cfg.priority));
+  let subText = subParts.join(' · ');
+  if (w) {
+    const wp = Math.max(0, Number(w.price) || 0), wq = Math.max(0, Number(w.quality) || 0), ws = Math.max(0, Number(w.safety) || 0);
+    const sum = wp + wq + ws;
+    if (sum > 0) subText += ` (가격 ${Math.round(wp / sum * 100)}% · 품질 ${Math.round(wq / sum * 100)}% · 안정 ${Math.round(ws / sum * 100)}%)`;
+  }
+  sub.textContent = subText.trim();
+  sub.style.cssText = 'font-size:11px;color:#4b5563;margin-bottom:8px';
+  if (sub.textContent) body.appendChild(sub);
+
+  if (!result) {
+    const err = document.createElement('div');
+    err.textContent = errorText || '순위를 계산하지 못했어요.';
+    err.style.cssText = 'font-size:12px;color:#b45309;background:#fffbeb;border:1px solid #fcd34d;border-radius:8px;padding:8px';
+    body.appendChild(err);
+  } else {
+    const rows = (Array.isArray(result.ranked) ? result.ranked : [])
+      .filter((r) => r && Number.isFinite(Number(r.rank)))
+      .sort((a, b) => Number(a.rank) - Number(b.rank))
+      .slice(0, 5);
+    const cardInfos = rankOvCardInfos();
+    const cardPids = new Set(cardInfos.map((c) => c.productId));
+    if (!rows.length) {
+      const none = document.createElement('div');
+      none.textContent = '순위를 매길 수 있는 상품이 없어요.';
+      none.style.cssText = 'font-size:12px;color:#6b7280;padding:6px 0';
+      body.appendChild(none);
+    }
+    for (const r of rows) {
+      const top3 = Number(r.rank) <= 3;
+      const row = document.createElement('div');
+      row.style.cssText = 'display:flex;gap:8px;align-items:flex-start;padding:7px 4px;border-top:1px solid #eef2ff;cursor:pointer;border-radius:8px';
+      row.title = '누르면 상품 상세를 새 탭으로 열어요';
+      row.addEventListener('mouseenter', () => { row.style.background = '#eef2ff'; });
+      row.addEventListener('mouseleave', () => { row.style.background = ''; });
+      row.addEventListener('click', () => rankOvOpen(r.link));
+
+      const rk = document.createElement('div');
+      rk.textContent = rankOvScore(r.rank);
+      rk.style.cssText = `flex-shrink:0;width:22px;height:22px;border-radius:50%;display:flex;align-items:center;justify-content:center;font:800 12px/1 ${RANK_FONT};`
+        + (top3 ? `background:${RANK_INDIGO};color:#fff` : 'background:#eef2ff;color:#3730a3');
+
+      const main = document.createElement('div');
+      main.style.cssText = 'flex:1;min-width:0';
+      const nm = document.createElement('div');
+      nm.textContent = r.name || '(이름 없음)';
+      nm.style.cssText = 'font-size:12px;font-weight:600;color:#111827;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:break-all';
+      const pr = document.createElement('div');
+      pr.textContent = rankOvFmtWon(r.price) + (r.unitPriceLabel ? ` · ${r.unitPriceLabel}` : '');
+      pr.style.cssText = 'font-size:12px;font-weight:800;color:#111827;margin-top:2px';
+      const ax = document.createElement('div');
+      ax.textContent = '점수 ' + rankOvAxes(r.scores, !!r.dataInsufficient);
+      ax.style.cssText = 'font-size:10.5px;color:#6b7280;margin-top:1px';
+      main.appendChild(nm);
+      main.appendChild(pr);
+      main.appendChild(ax);
+
+      const right = document.createElement('div');
+      right.style.cssText = 'flex-shrink:0;display:flex;flex-direction:column;align-items:flex-end;gap:4px';
+      const tot = document.createElement('div');
+      tot.textContent = `${rankOvScore(r.scores && r.scores.total)}점`;
+      tot.style.cssText = `font:800 13px/1.2 ${RANK_FONT};color:${RANK_INDIGO}`;
+      right.appendChild(tot);
+      if (cardPids.has(String(r.productId))) {
+        const loc = rankOvSmallBtn('위치', '이 페이지에서 카드 위치로 이동');
+        loc.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); rankOvLocate(String(r.productId)); });
+        right.appendChild(loc);
+      }
+
+      row.appendChild(rk);
+      row.appendChild(main);
+      row.appendChild(right);
+      body.appendChild(row);
+    }
+
+    const count = Number.isFinite(Number(result.candidateCount)) ? Number(result.candidateCount) : RANK_OV.itemCount;
+    const rankedCount = Number.isFinite(Number(result.rankedCount)) ? Number(result.rankedCount) : rows.length;
+    const foot = document.createElement('div');
+    foot.textContent = rankOvFooterText(count, rankedCount, result.excluded);
+    foot.style.cssText = 'margin-top:8px;padding-top:7px;border-top:1px solid #eef2ff;font-size:10.5px;color:#6b7280';
+    body.appendChild(foot);
+  }
+
+  box.appendChild(body);
+  document.documentElement.appendChild(box);
+  RANK_OV.panel = box;
+}
+
+// 수집 → rankSearchItems → 렌더. firstRun 이면 못 읽었을 때도 패널로 알린다.
+function rankOvRun(firstRun) {
+  if (!RANK_OV.active || RANK_OV.dead) return;
+  if (!isCoupangSearchPage()) { rankOvClearAll(); RANK_OV.lastSig = ''; return; }
+  if (RANK_OV.busy) { RANK_OV.pending = true; return; }
+  const infos = rankOvCardInfos();
+  if (infos.length) RANK_OV.sawCards = true;
+  const res = collectCoupangSearchResults();
+  RANK_OV.lastSig = rankOvSig(infos);
+  if (!res.ok || !res.items.length) {
+    if (!res.ok) { try { console.warn('[ShoMate] 검색 결과 수집 실패:', res.error); } catch (_) {} }
+    if (firstRun) {
+      rankOvRenderPanel(null, res.denied
+        ? '쿠팡이 이 페이지 접근을 막아 순위를 매기지 못했어요.'
+        : RANK_EMPTY_TEXT);
+    }
+    return;
+  }
+  RANK_OV.itemCount = res.items.length;
+  RANK_OV.busy = true;
+  const seq = ++RANK_OV.seq;
+  rankOvSend({ type: 'rankSearchItems', url: location.href, items: res.items }, (r) => {
+    RANK_OV.busy = false;
+    if (seq !== RANK_OV.seq || RANK_OV.dead) return;
+    try {
+      if (r && r.ok) {
+        RANK_OV.result = r;
+        rankOvRenderBadges(r);
+        rankOvRenderPanel(r, null);
+      } else {
+        RANK_OV.result = null;
+        rankOvClearBadges();
+        rankOvRenderPanel(null, (r && typeof r.error === 'string' && r.error) || 'ShoMate 응답이 없어 순위를 계산하지 못했어요.');
+      }
+    } catch (_) {}
+    if (RANK_OV.pending) { RANK_OV.pending = false; rankOvCheck(); }
+  });
+}
+
+// 목록 변화 점검 — 카드 productId 집합이 바뀌면 재수집·재순위, 같은데 배지가 사라졌으면(재렌더) 마지막 결과로 다시 붙인다.
+function rankOvCheck() {
+  if (!RANK_OV.active || RANK_OV.dead) return;
+  if (!isCoupangSearchPage()) { rankOvClearAll(); RANK_OV.lastSig = ''; return; }
+  const infos = rankOvCardInfos();
+  if (!infos.length) { rankOvCheckEmpty(); return; }   // 목록을 다시 그리는 중이거나 카드가 없는 페이지
+  RANK_OV.emptySince = null;
+  RANK_OV.emptyShown = false;
+  RANK_OV.sawCards = true;
+  if (rankOvSig(infos) !== RANK_OV.lastSig) { rankOvRun(false); return; }
+  if (RANK_OV.result && !RANK_OV.busy) {
+    let now = 0;
+    try { now = document.querySelectorAll('[data-shomate-rank]').length; } catch (_) {}
+    if (now < RANK_OV.badgeCount) rankOvRenderBadges(RANK_OV.result);
+  }
+}
+
+// 카드 0개 상태가 이어지는지 본다. 클라이언트 이동 뒤(또는 카드가 있다가 사라진 뒤) 10초 넘게 0개면
+// 이전 검색어의 배지·순위를 지우고 패널에 못 읽었다고 알린다(지난 순위를 지금 페이지 것처럼 두지 않는다).
+function rankOvCheckEmpty() {
+  if (!(RANK_OV.navigated || RANK_OV.sawCards)) return;   // 처음부터 카드가 없던 페이지는 첫 실행이 이미 알렸다
+  if (RANK_OV.emptySince == null) { RANK_OV.emptySince = Date.now(); return; }
+  if (RANK_OV.emptyShown || Date.now() - RANK_OV.emptySince < RANK_EMPTY_GRACE_MS) return;
+  RANK_OV.emptyShown = true;
+  RANK_OV.seq++;            // 진행 중인 rankSearchItems 응답이 지운 배지를 다시 그리지 않게
+  RANK_OV.result = null;
+  RANK_OV.lastSig = '';     // 카드가 다시 나타나면 새로 수집·순위
+  rankOvClearBadges();
+  rankOvRenderPanel(null, RANK_EMPTY_TEXT);
+}
+
+// 우리 노드(배지·패널)가 '추가'된 변화는 무시한다. 우리 배지가 '제거'된 것은 남의 재렌더라 다시 붙여야 한다.
+const rankOvIsOwn = (n) => !!(n && n.nodeType === 1 && (n.hasAttribute('data-shomate-rank') || n.id === RANK_PANEL_ID));
+
+function rankOvAttachObserver() {
+  if (RANK_OV.obs) { try { RANK_OV.obs.disconnect(); } catch (_) {} RANK_OV.obs = null; }
+  // #product-list 의 부모를 우선. class 부분 일치 후보는 #product-list 를 실제로 품을 때만 쓴다
+  // (이름만 비슷한 다른 요소를 감시하면 같은 URL 안의 카드 교체를 놓친다).
+  let target = null;
+  try {
+    const pl = document.getElementById('product-list');
+    if (pl) {
+      const cands = [pl.parentElement, document.querySelector('[class*="ProductList_productList"]')];
+      target = cands.find((c) => c && c !== pl && c.contains(pl)) || null;
+    }
+    if (!target) target = document.body;
+  } catch (_) { target = document.body; }
+  if (!target) return;
+  RANK_OV.obsTarget = target;
+  RANK_OV.obs = new MutationObserver((muts) => {
+    const relevant = muts.some((m) => {
+      try {
+        if (m.target && m.target.nodeType === 1 && m.target.closest('[data-shomate-rank]')) return false;
+        const nodes = Array.from(m.addedNodes).filter((n) => !rankOvIsOwn(n)).concat(Array.from(m.removedNodes));
+        return nodes.length > 0;
+      } catch (_) { return true; }
+    });
+    if (!relevant) return;
+    clearTimeout(RANK_OV.debounce);
+    RANK_OV.debounce = setTimeout(rankOvCheck, 800);
+  });
+  try { RANK_OV.obs.observe(target, { childList: true, subtree: true }); } catch (_) {}
+}
+
+// 1초마다 URL·감시 대상 확인 — Next.js 가 페이지 로드 없이 정렬·필터·검색어를 바꿔도 따라간다
+function rankOvStartPoll() {
+  clearInterval(RANK_OV.poll);
+  RANK_OV.poll = setInterval(() => {
+    if (RANK_OV.dead) return;
+    try { if (!chrome.runtime || !chrome.runtime.id) { rankOvStop(); return; } } catch (_) { rankOvStop(); return; }
+    const href = location.href;
+    const gone = !RANK_OV.obsTarget || !RANK_OV.obsTarget.isConnected;
+    if (href !== RANK_OV.lastHref || gone) {
+      if (href !== RANK_OV.lastHref) { RANK_OV.navigated = true; RANK_OV.emptySince = null; RANK_OV.emptyShown = false; }
+      RANK_OV.lastHref = href;
+      rankOvAttachObserver();
+      rankOvCheck();
+    } else if (RANK_OV.emptySince != null && !RANK_OV.emptyShown) {
+      rankOvCheck();   // 카드 0개가 이어지는 동안 10초 경과를 잰다
+    }
+  }, 1000);
+}
+
+function rankOvInit(attempt) {
+  if (!isCoupangSearchPage()) return;
+  rankOvSend({ type: 'rankTabStatus' }, (st) => {
+    if (!st || typeof st !== 'object') return;
+    if (!st.isRankTab) {
+      // 버튼으로 연 직후 background 가 rankTabs 를 저장하기 전에 물었을 수 있어 한 번만 다시 묻는다
+      if (attempt < 1) setTimeout(() => rankOvInit(attempt + 1), 2000);
+      return;
+    }
+    if (RANK_OV.active) return;
+    RANK_OV.active = true;
+    RANK_OV.config = st;
+    // 좁은 화면(768px 이하)에서는 패널이 목록을 덮지 않게 처음부터 알약으로 접어 둔다
+    RANK_OV.collapsed = rankOvNarrow(768);
+    RANK_OV.lastHref = location.href;
+    const t0 = Date.now();
+    const wait = () => {
+      if (RANK_OV.dead) return;
+      if (rankOvCardInfos().length || Date.now() - t0 >= 10000) {
+        rankOvRun(true);
+        rankOvAttachObserver();
+        rankOvStartPoll();
+        return;
+      }
+      setTimeout(wait, 500);
+    };
+    wait();
+  });
+}
+if (isCoupangSearchPage()) rankOvInit(0);
